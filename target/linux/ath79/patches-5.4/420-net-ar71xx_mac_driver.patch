@@ -1,0 +1,24 @@
+--- a/drivers/net/ethernet/atheros/Kconfig
++++ b/drivers/net/ethernet/atheros/Kconfig
+@@ -17,14 +17,6 @@ config NET_VENDOR_ATHEROS
+ 
+ if NET_VENDOR_ATHEROS
+ 
+-config AG71XX
+-	tristate "Atheros AR7XXX/AR9XXX built-in ethernet mac support"
+-	depends on ATH79
+-	select PHYLIB
+-	help
+-	  If you wish to compile a kernel for AR7XXX/91XXX and enable
+-	  ethernet support, then you should always answer Y to this.
+-
+ config ATL2
+ 	tristate "Atheros L2 Fast Ethernet support"
+ 	depends on PCI
+@@ -87,4 +79,6 @@ config ALX
+ 	  To compile this driver as a module, choose M here.  The module
+ 	  will be called alx.
+ 
++source "drivers/net/ethernet/atheros/ag71xx/Kconfig"
++
+ endif # NET_VENDOR_ATHEROS
