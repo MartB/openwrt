@@ -19,7 +19,7 @@ Signed-off-by: John Crispin <john@phrozen.org>
  	select SYS_SUPPORTS_BIG_ENDIAN
  	select SYS_SUPPORTS_MIPS16
  	select SYS_SUPPORTS_ZBOOT_UART_PROM
-+	select HW_HAS_PCI
++	select HAVE_PCI
 +	select USB_ARCH_HAS_EHCI
  	select USE_OF
  	select USB_EHCI_ROOT_HUB_TT if USB_EHCI_HCD_PLATFORM
