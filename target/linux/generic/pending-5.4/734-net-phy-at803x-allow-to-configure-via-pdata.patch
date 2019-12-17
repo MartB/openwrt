@@ -65,10 +65,11 @@ Signed-off-by: Gabor Juhos <juhosg@openwrt.org>
  	int ret;
  
  	/* The RX and TX delay default is:
-@@ -315,6 +331,9 @@ static int at803x_config_intr(struct phy
+@@ -315,6 +331,10 @@ static int at803x_config_intr(struct phy
  
  static void at803x_link_change_notify(struct phy_device *phydev)
  {
++	struct at803x_priv *priv = phydev->priv;
 +	struct at803x_platform_data *pdata;
 +	pdata = dev_get_platdata(&phydev->mdio.dev);
 +
@@ -101,10 +102,11 @@ Signed-off-by: Gabor Juhos <juhosg@openwrt.org>
  }
  
  static int at803x_aneg_done(struct phy_device *phydev)
-@@ -423,6 +461,26 @@ static int at803x_read_status(struct phy
+@@ -423,6 +461,27 @@ static int at803x_read_status(struct phy
  	if (phydev->autoneg == AUTONEG_ENABLE && phydev->autoneg_complete)
  		phy_resolve_aneg_pause(phydev);
  
++	struct at803x_platform_data *pdata;
 +	pdata = dev_get_platdata(&phydev->mdio.dev);
 +	if (pdata) {
 +		if (pdata->disable_smarteee)
