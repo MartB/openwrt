@@ -594,9 +594,12 @@ swconfig_parse_ports(struct sk_buff *msg, struct nlattr *head,
 #if LINUX_VERSION_CODE < KERNEL_VERSION(4,12,0)
 		if (nla_parse_nested(tb, SWITCH_PORT_ATTR_MAX, nla,
 				port_policy))
-#else
+#elif LINUX_VERSION_CODE < KERNEL_VERSION(5,2,0)
 		if (nla_parse_nested(tb, SWITCH_PORT_ATTR_MAX, nla,
 				port_policy, NULL))
+#else
+		if (nla_parse_nested_deprecated(tb, SWITCH_PORT_ATTR_MAX, nla,
+				port_policy, NULL))	
 #endif
 			return -EINVAL;
 
@@ -620,8 +623,10 @@ swconfig_parse_link(struct sk_buff *msg, struct nlattr *nla,
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(4,12,0)
 	if (nla_parse_nested(tb, SWITCH_LINK_ATTR_MAX, nla, link_policy))
-#else
+#elif LINUX_VERSION_CODE < KERNEL_VERSION(5,2,0)
 	if (nla_parse_nested(tb, SWITCH_LINK_ATTR_MAX, nla, link_policy, NULL))
+#else
+	if (nla_parse_nested_deprecated(tb, SWITCH_LINK_ATTR_MAX, nla, link_policy, NULL))
 #endif
 		return -EINVAL;
 
@@ -725,12 +730,12 @@ swconfig_send_port(struct swconfig_callback *cb, void *arg)
 	struct nlattr *p = NULL;
 
 	if (!cb->nest[0]) {
-		cb->nest[0] = nla_nest_start(cb->msg, cb->cmd);
+		cb->nest[0] = nla_nest_start_noflag(cb->msg, cb->cmd);
 		if (!cb->nest[0])
 			return -1;
 	}
 
-	p = nla_nest_start(cb->msg, SWITCH_ATTR_PORT);
+	p = nla_nest_start_noflag(cb->msg, SWITCH_ATTR_PORT);
 	if (!p)
 		goto error;
 
@@ -769,7 +774,7 @@ swconfig_send_ports(struct sk_buff **msg, struct genl_info *info, int attr,
 	cb.fill = swconfig_send_port;
 	cb.close = swconfig_close_portlist;
 
-	cb.nest[0] = nla_nest_start(cb.msg, cb.cmd);
+	cb.nest[0] = nla_nest_start_noflag(cb.msg, cb.cmd);
 	for (i = 0; i < val->len; i++) {
 		err = swconfig_send_multipart(&cb, &val->value.ports[i]);
 		if (err)
@@ -790,7 +795,7 @@ swconfig_send_link(struct sk_buff *msg, struct genl_info *info, int attr,
 	struct nlattr *p = NULL;
 	int err = 0;
 
-	p = nla_nest_start(msg, attr);
+	p = nla_nest_start_noflag(msg, attr);
 	if (link->link) {
 		if (nla_put_flag(msg, SWITCH_LINK_FLAG_LINK))
 			goto nla_put_failure;
@@ -944,11 +949,11 @@ swconfig_send_switch(struct sk_buff *msg, u32 pid, u32 seq, int flags,
 	if (nla_put_u32(msg, SWITCH_ATTR_CPU_PORT, dev->cpu_port))
 		goto nla_put_failure;
 
-	m = nla_nest_start(msg, SWITCH_ATTR_PORTMAP);
+	m = nla_nest_start_noflag(msg, SWITCH_ATTR_PORTMAP);
 	if (!m)
 		goto nla_put_failure;
 	for (i = 0; i < dev->ports; i++) {
-		p = nla_nest_start(msg, SWITCH_ATTR_PORTS);
+		p = nla_nest_start_noflag(msg, SWITCH_ATTR_PORTS);
 		if (!p)
 			continue;
 		if (dev->portmap[i].s) {
