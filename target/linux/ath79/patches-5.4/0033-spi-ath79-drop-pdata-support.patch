@@ -17,24 +17,23 @@ Signed-off-by: John Crispin <john@phrozen.org>
 
 --- a/drivers/spi/spi-ath79.c
 +++ b/drivers/spi/spi-ath79.c
-@@ -138,7 +138,6 @@ static int ath79_spi_probe(struct platfo
+@@ -213,7 +213,6 @@ static int ath79_spi_probe(struct platform_device *pdev)
  {
  	struct spi_master *master;
  	struct ath79_spi *sp;
 -	struct ath79_spi_platform_data *pdata;
+ 	struct resource	*r;
  	unsigned long rate;
  	int ret;
- 
-@@ -152,16 +151,10 @@ static int ath79_spi_probe(struct platfo
+@@ -228,15 +227,9 @@ static int ath79_spi_probe(struct platform_device *pdev)
  	master->dev.of_node = pdev->dev.of_node;
  	platform_set_drvdata(pdev, sp);
  
 -	pdata = dev_get_platdata(&pdev->dev);
 -
- 	master->use_gpio_descriptors = true;
  	master->bits_per_word_mask = SPI_BPW_RANGE_MASK(1, 32);
- 	master->setup = spi_bitbang_setup;
- 	master->cleanup = spi_bitbang_cleanup;
+ 	master->setup = ath79_spi_setup;
+ 	master->cleanup = ath79_spi_cleanup;
 -	if (pdata) {
 -		master->bus_num = pdata->bus_num;
 -		master->num_chipselect = pdata->num_chipselect;
