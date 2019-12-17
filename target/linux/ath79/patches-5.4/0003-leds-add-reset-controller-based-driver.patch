@@ -108,7 +108,7 @@ Signed-off-by: John Crispin <john@phrozen.org>
 +			fwnode_handle_put(child);
 +			return ERR_PTR(-EINVAL);
 +		}
-+		led->rst = __of_reset_control_get(np, NULL, 0, 0, 0);
++		led->rst = __of_reset_control_get(np, NULL, 0, 0, 0, true);
 +		if (IS_ERR(led->rst))
 +			return ERR_PTR(-EINVAL);
 +
@@ -116,7 +116,7 @@ Signed-off-by: John Crispin <john@phrozen.org>
 +						&led->cdev.default_trigger);
 +
 +		led->cdev.brightness_set = reset_led_set;
-+		ret = devm_of_led_classdev_register(&pdev->dev, np, &led->cdev);
++		ret = devm_led_classdev_register_ext(&pdev->dev, &led->cdev, NULL);
 +		if (ret < 0)
 +			return ERR_PTR(ret);
 +		led->cdev.dev->of_node = np;
