@@ -1,0 +1,36 @@
+From 39ab50d24bf951a95c366d6dbfc3026374f34111 Mon Sep 17 00:00:00 2001
+From: root <root@DESKTOP-F8OG7UM.localdomain>
+Date: Tue, 17 Dec 2019 16:04:37 +0100
+Subject: [PATCH 1/4] Revert "spi: ath79: use devm_platform_ioremap_resource()
+ to simplify code"
+
+This reverts commit bf3484190fd45e2d7c5c52306a4973ce55f7e694.
+---
+ drivers/spi/spi-ath79.c | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/spi/spi-ath79.c b/drivers/spi/spi-ath79.c
+index eb9a243e9526..032a615e4ccd 100644
+--- a/drivers/spi/spi-ath79.c
++++ b/drivers/spi/spi-ath79.c
+@@ -139,6 +139,7 @@ static int ath79_spi_probe(struct platform_device *pdev)
+ 	struct spi_master *master;
+ 	struct ath79_spi *sp;
+ 	struct ath79_spi_platform_data *pdata;
++	struct resource	*r;
+ 	unsigned long rate;
+ 	int ret;
+ 
+@@ -168,7 +169,8 @@ static int ath79_spi_probe(struct platform_device *pdev)
+ 	sp->bitbang.txrx_word[SPI_MODE_0] = ath79_spi_txrx_mode0;
+ 	sp->bitbang.flags = SPI_CS_HIGH;
+ 
+-	sp->base = devm_platform_ioremap_resource(pdev, 0);
++	r = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	sp->base = devm_ioremap_resource(&pdev->dev, r);
+ 	if (IS_ERR(sp->base)) {
+ 		ret = PTR_ERR(sp->base);
+ 		goto err_put_master;
+-- 
+2.24.0.windows.2
+

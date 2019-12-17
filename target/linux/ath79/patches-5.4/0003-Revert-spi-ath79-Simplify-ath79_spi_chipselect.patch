@@ -1,0 +1,80 @@
+From 589659bb9cc3a17c17d0d7ae9ed6343365e06212 Mon Sep 17 00:00:00 2001
+From: root <root@DESKTOP-F8OG7UM.localdomain>
+Date: Tue, 17 Dec 2019 16:06:48 +0100
+Subject: [PATCH 3/4] Revert "spi: ath79: Simplify ath79_spi_chipselect()"
+
+This reverts commit 797622d7a3ab5192ff575288bdbec15c3a006280.
+---
+ drivers/spi/spi-ath79.c | 40 +++++++++++++++++++++++++++++++---------
+ 1 file changed, 31 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/spi/spi-ath79.c b/drivers/spi/spi-ath79.c
+index 121eb2f6f788..b9e33bbcd847 100644
+--- a/drivers/spi/spi-ath79.c
++++ b/drivers/spi/spi-ath79.c
+@@ -17,6 +17,7 @@
+ #include <linux/spi/spi.h>
+ #include <linux/spi/spi_bitbang.h>
+ #include <linux/bitops.h>
++#include <linux/gpio/consumer.h>
+ #include <linux/clk.h>
+ #include <linux/err.h>
+ #include <linux/platform_data/spi-ath79.h>
+@@ -71,14 +72,38 @@ static void ath79_spi_chipselect(struct spi_device *spi, int is_active)
+ {
+ 	struct ath79_spi *sp = ath79_spidev_to_sp(spi);
+ 	int cs_high = (spi->mode & SPI_CS_HIGH) ? is_active : !is_active;
+-	u32 cs_bit = AR71XX_SPI_IOC_CS(spi->chip_select);
+ 
+-	if (cs_high)
+-		sp->ioc_base |= cs_bit;
+-	else
+-		sp->ioc_base &= ~cs_bit;
++	if (is_active) {
++		/* set initial clock polarity */
++		if (spi->mode & SPI_CPOL)
++			sp->ioc_base |= AR71XX_SPI_IOC_CLK;
++		else
++			sp->ioc_base &= ~AR71XX_SPI_IOC_CLK;
++
++		ath79_spi_wr(sp, AR71XX_SPI_REG_IOC, sp->ioc_base);
++	}
++
++	if (spi->cs_gpiod) {
++		/*
++		 * SPI chipselect is normally active-low, but
++		 * inversion semantics are handled by gpiolib.
++		 *
++		 * FIXME: is this ever used? The driver doesn't
++		 * set SPI_MASTER_GPIO_SS so this callback should not
++		 * get called if a CS GPIO is found by the SPI core.
++		 */
++		gpiod_set_value_cansleep(spi->cs_gpiod, is_active);
++	} else {
++		u32 cs_bit = AR71XX_SPI_IOC_CS(spi->chip_select);
++
++		if (cs_high)
++			sp->ioc_base |= cs_bit;
++		else
++			sp->ioc_base &= ~cs_bit;
++
++		ath79_spi_wr(sp, AR71XX_SPI_REG_IOC, sp->ioc_base);
++	}
+ 
+-	ath79_spi_wr(sp, AR71XX_SPI_REG_IOC, sp->ioc_base);
+ }
+ 
+ static void ath79_spi_enable(struct ath79_spi *sp)
+@@ -90,9 +115,6 @@ static void ath79_spi_enable(struct ath79_spi *sp)
+ 	sp->reg_ctrl = ath79_spi_rr(sp, AR71XX_SPI_REG_CTRL);
+ 	sp->ioc_base = ath79_spi_rr(sp, AR71XX_SPI_REG_IOC);
+ 
+-	/* clear clk and mosi in the base state */
+-	sp->ioc_base &= ~(AR71XX_SPI_IOC_DO | AR71XX_SPI_IOC_CLK);
+-
+ 	/* TODO: setup speed? */
+ 	ath79_spi_wr(sp, AR71XX_SPI_REG_CTRL, 0x43);
+ }
+-- 
+2.24.0.windows.2
+
