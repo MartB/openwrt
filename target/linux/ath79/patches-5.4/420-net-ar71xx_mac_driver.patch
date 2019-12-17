@@ -22,3 +22,14 @@
 +source "drivers/net/ethernet/atheros/ag71xx/Kconfig"
 +
  endif # NET_VENDOR_ATHEROS
+--- a/drivers/net/ethernet/atheros/Makefile
++++ b/drivers/net/ethernet/atheros/Makefile
+@@ -3,7 +3,7 @@
+ # Makefile for the Atheros network device drivers.
+ #
+ 
+-obj-$(CONFIG_AG71XX) += ag71xx.o
++obj-$(CONFIG_AG71XX) += ag71xx/
+ obj-$(CONFIG_ATL1) += atlx/
+ obj-$(CONFIG_ATL2) += atlx/
+ obj-$(CONFIG_ATL1E) += atl1e/
