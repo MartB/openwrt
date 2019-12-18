@@ -14,12 +14,11 @@ PKG_MAINTAINER:=Felix Fietkau <nbd@nbd.name>
 PKG_LICENSE:=GPL-2.0
 
 include $(INCLUDE_DIR)/package.mk
-include $(INCLUDE_DIR)/kernel.mk
 
 define Package/swconfig
   SECTION:=base
   CATEGORY:=Base system
-  DEPENDS:=+libuci +libnl-tiny
+  DEPENDS:=+libuci +libnl
   TITLE:=Switch configuration utility
 endef
 
@@ -28,16 +27,16 @@ TARGET_LDFLAGS += -flto=jobserver
 
 TARGET_CPPFLAGS := \
 	-D_GNU_SOURCE \
-	-I$(STAGING_DIR)/usr/include/libnl-tiny \
+	-I$(STAGING_DIR)/usr/include/libnl3\
+	-I$(LINUX_DIR)/include \
 	-I$(PKG_BUILD_DIR) \
-	$(TARGET_CPPFLAGS) \
-	-I$(LINUX_DIR)/user_headers/include
+	$(TARGET_CPPFLAGS)
 
 define Build/Compile
 	CFLAGS="$(TARGET_CPPFLAGS) $(TARGET_CFLAGS)" \
 	$(MAKE) -C $(PKG_BUILD_DIR) \
 		$(TARGET_CONFIGURE_OPTS) \
-		LIBS="$(TARGET_LDFLAGS) -lnl-tiny -lm -luci -lubox"
+		LIBS="-L$(STAGING_DIR)/usr/lib $(STAGING_DIR)/usr/lib/libnl-genl-3.a $(STAGING_DIR)/usr/lib/libnl-3.a -lm -luci -lubox"
 endef
 
 define Build/InstallDev

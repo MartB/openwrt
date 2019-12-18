@@ -21,11 +21,6 @@
 #include <linux/netdevice.h>
 #include <linux/netlink.h>
 #include <linux/genetlink.h>
-#ifndef __KERNEL__
-#include <netlink/netlink.h>
-#include <netlink/genl/genl.h>
-#include <netlink/genl/ctrl.h>
-#endif
 
 /* main attributes */
 enum {
