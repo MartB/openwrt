@@ -19,3 +19,14 @@ Signed-off-by: Gabor Juhos <juhosg@openwrt.org>
  endmenu
  
  config MTD_TESTS
+--- a/drivers/mtd/Makefile
++++ b/drivers/mtd/Makefile
+@@ -6,6 +6,7 @@
+ # Core functionality.
+ obj-$(CONFIG_MTD)		+= mtd.o
+ mtd-y				:= mtdcore.o mtdsuper.o mtdconcat.o mtdpart.o mtdchar.o
++obj-$(CONFIG_MTD_SPLIT)		+= mtdsplit/
+ 
+ obj-y				+= parsers/
+ obj-$(CONFIG_MTD_TPLINK_PARTS)	+= tplinkpart.o
+
