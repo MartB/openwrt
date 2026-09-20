@@ -1,0 +1,21 @@
+#!/bin/sh /etc/rc.common
+
+# after lldpd (START=90), so the socket exists when we apply
+START=91
+USE_PROCD=1
+
+start_service() {
+	/usr/sbin/lldpd-port-labels
+}
+
+reload_service() {
+	/usr/sbin/lldpd-port-labels
+}
+
+# No instance: this service exists purely to own the trigger. procd still
+# registers it, because _procd_close_service() calls service_triggers()
+# whether or not an instance was opened.
+service_triggers() {
+	procd_add_config_trigger "config.change" "luci" \
+		/etc/init.d/lldpd-port-labels reload
+}
