@@ -1,0 +1,555 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+//
+// PoE status for switches using the kernel PSE-PD framework.
+//
+// Each ethtool query is several round trips over the PSE MCU's serial link,
+// so the port list is kept short and the UI polls slowly.
+
+'use strict';
+
+import { glob, open, popen, readfile } from 'fs';
+import { cursor } from 'uci';
+
+const uci = cursor();
+
+// Fallback only, for a kernel without the power_available attribute. 130 W on
+// the XMG1915-10EP.
+const DEFAULT_BUDGET_MW = 130000;
+
+// The attributes live on the MCU's transport device, whose path depends on how
+// it is attached, so glob rather than hardcode.
+function pse_attr(name) {
+	for (let pat in [ `/sys/bus/serial/devices/*/${name}`,
+			  `/sys/devices/platform/*/*/*/${name}`,
+			  `/sys/devices/platform/*/*/${name}` ]) {
+		for (let f in glob(pat) ?? []) {
+			const v = trim(readfile(f) ?? '');
+			if (length(v))
+				return +v;
+		}
+	}
+
+	return null;
+}
+
+// Same search as pse_attr, but the caller wants somewhere to write.
+function pse_attr_path(name) {
+	for (let pat in [ `/sys/bus/serial/devices/*/${name}`,
+			  `/sys/devices/platform/*/*/*/${name}`,
+			  `/sys/devices/platform/*/*/${name}` ]) {
+		for (let f in glob(pat) ?? [])
+			return f;
+	}
+
+	return null;
+}
+
+// Per-port knobs are numbered by PSE port, not by interface. On this family
+// that is lanN minus one: PoE is on the first eight copper ports.
+function pse_port_index(port) {
+	const m = match(port, /^lan([0-9]+)$/);
+
+	return m ? (+m[1] - 1) : null;
+}
+
+function port_legacy(port) {
+	const idx = pse_port_index(port);
+	if (idx == null)
+		return null;
+
+	const v = pse_attr(`port${idx}/detection_legacy`);
+
+	return v == null ? null : (v != 0);
+}
+
+function poe_ports() {
+	uci.load('luci');
+
+	uci.load('poe-led');
+	const configured = uci.get('poe-led', 'main', 'ports');
+	if (configured)
+		return type(configured) == 'array' ? configured : split(configured, /\s+/);
+
+	// Default: every lanN that reports a PSE.
+	let found = [];
+	for (let i = 1; i <= 8; i++)
+		push(found, `lan${i}`);
+
+	return found;
+}
+
+// The MCU reports how much is left, never the total. Available and the
+// per-port draws are separate round trips, so their sum drifts by about a
+// watt - fine for a percentage, not a figure to quote.
+function budget_mw(used) {
+	const avail = pse_attr('power_available');
+	if (avail)
+		return { mw: avail + used, free: avail, measured: true, source: 'hardware' };
+
+	uci.load('poe-led');
+	const cfg = +(uci.get('poe-led', 'main', 'budget_mw') || 0);
+	if (cfg)
+		return { mw: cfg, free: cfg - used, measured: false, source: 'configured' };
+
+	return { mw: DEFAULT_BUDGET_MW, free: DEFAULT_BUDGET_MW - used,
+		 measured: false, source: 'default' };
+}
+
+// Factory data, cached into /tmp/sysinfo at boot by boardinfo(8).
+function board() {
+	const get = (f) => trim(readfile(`/tmp/sysinfo/${f}`) ?? '') || null;
+
+	return {
+		serial:  get('board_serial'),
+		hwver:   get('board_hwversion'),
+		product: get('board_product'),
+	};
+}
+
+function port_label(port) {
+	uci.load('luci');
+	return uci.get('luci', 'port_labels', port) || '';
+}
+
+// Every hwmon sensor the kernel exposes: the SoC thermal zone, both SFP cages
+// when a DOM-capable module is in, and anything else that turns up. Pure sysfs,
+// no MCU traffic, so it rides along with the status poll.
+function temperatures() {
+	let out = [];
+
+	for (let dir in glob('/sys/class/hwmon/hwmon*') ?? []) {
+		const chip = trim(readfile(`${dir}/name`) ?? '') || 'sensor';
+
+		for (let f in glob(`${dir}/temp*_input`) ?? []) {
+			const raw = trim(readfile(f) ?? '');
+			if (!length(raw))
+				continue;
+
+			// temp1_input -> temp1_label
+			const label = trim(readfile(replace(f, /_input$/, '_label')) ?? '');
+
+			push(out, {
+				chip:  chip,
+				label: label,
+				mc:    +raw,
+			});
+		}
+	}
+
+	return out;
+}
+
+// fan1_fault is the value worth alarming on: an RPM of zero alone cannot say
+// whether the fan stopped or was never fitted.
+function fans() {
+	let out = [];
+
+	for (let dir in glob('/sys/class/hwmon/hwmon*') ?? []) {
+		const chip = trim(readfile(`${dir}/name`) ?? '') || 'fan';
+
+		for (let f in glob(`${dir}/fan*_input`) ?? []) {
+			const raw = trim(readfile(f) ?? '');
+			if (!length(raw))
+				continue;
+
+			const fault = trim(readfile(replace(f, /_input$/, '_fault')) ?? '');
+			const alarm = trim(readfile(replace(f, /_input$/, '_alarm')) ?? '');
+
+			push(out, {
+				chip:  chip,
+				rpm:   +raw,
+				fault: length(fault) ? (+fault != 0) : null,
+				alarm: length(alarm) ? (+alarm != 0) : null,
+			});
+		}
+	}
+
+	return out;
+}
+
+// Link-down power saving, on the PHY rather than the PSE. DSA user ports get
+// no phydev symlink, so go via the mdio bus: copper lanN sits at PHY address
+// N-1, which is unique across the busses because each quad takes four in turn.
+function phy_path(port) {
+	const m = match(port, /^lan([0-9]+)$/);
+	if (!m)
+		return null;
+
+	for (let d in glob(sprintf('/sys/bus/mdio_bus/devices/*:%02x', +m[1] - 1)) ?? [])
+		return d;
+
+	return null;
+}
+
+// Absent unless the driver exposes it, so null means "no such knob", not "off".
+function port_aldps(port) {
+	const d = phy_path(port);
+	if (!d)
+		return null;
+
+	const v = trim(readfile(`${d}/aldps`) ?? '');
+
+	return length(v) ? (+v != 0) : null;
+}
+
+// Local netlink, not an MCU round trip, so this is cheap next to read_port().
+function port_eee(port) {
+	const fd = popen(`ethtool --show-eee ${port} 2>/dev/null`, 'r');
+	if (!fd)
+		return null;
+
+	const out = fd.read('all') ?? '';
+	fd.close();
+
+	const m = match(out, /EEE status:\s*(\S+)/);
+	if (!m)
+		return null;
+
+	// "enabled" and "active" both mean on; "disabled" and "not supported" do not.
+	return (m[1] == 'enabled' || m[1] == 'active');
+}
+
+// One ethtool call per port. Numbers are anchored after their keyword so
+// "Clause 33" cannot be mistaken for a value; "Priority:" starts its own line,
+// hence the leading newline.
+function read_port(port) {
+	const fd = popen(`ethtool --show-pse ${port} 2>/dev/null`, 'r');
+	if (!fd)
+		return null;
+
+	const out = fd.read('all') ?? '';
+	fd.close();
+
+	if (!length(out) || !match(out, /PSE attributes/))
+		return null;
+
+	const pick = (re) => { const m = match(out, re); return m ? m[1] : null; };
+	const num  = (re) => { const v = pick(re); return v != null ? +v : null; };
+
+	return {
+		port:     port,
+		label:    port_label(port),
+		admin:    pick(/Admin State:\s*(\S+)/),
+		status:   trim(pick(/Detection Status:\s*([^\n]+)/) ?? ''),
+		class:    num(/Power Class:\s*([0-9]+)/),
+		power_mw: num(/Actual Power:\s*([0-9]+)/),
+		limit_mw: num(/Available Power Limit:\s*([0-9]+)/),
+		priority: num(/\nPriority:\s*([0-9]+)/),
+		prio_max: num(/Max allowed priority:\s*([0-9]+)/),
+		carrier:  trim(readfile(`/sys/class/net/${port}/carrier`) ?? '') == '1',
+		eee:      port_eee(port),
+		legacy:   port_legacy(port),
+		aldps:    port_aldps(port),
+	};
+}
+
+// The uci device section that carries this port's `pse` option, by name
+// rather than by assuming a naming convention.
+function device_section(port) {
+	let sid = null;
+
+	uci.load('network');
+	uci.foreach('network', 'device', (s) => {
+		if (s.name == port) {
+			sid = s['.name'];
+			return false;
+		}
+	});
+
+	return sid;
+}
+
+const methods = {
+	getStatus: {
+		call: function() {
+			let ports = [], used = 0, faults = 0;
+
+			for (let p in poe_ports()) {
+				const d = read_port(p);
+				if (!d)
+					continue;
+
+				if (d.power_mw)
+					used += d.power_mw;
+				if (match(d.status ?? '', /fault/i))
+					faults++;
+
+				push(ports, d);
+			}
+
+			const budget = budget_mw(used);
+			const b = budget.mw;
+
+			return {
+				ports:     ports,
+				budget_mw: b,
+				budget_source: budget.source,
+				// Only set when the MCU measured it; the page quotes no total
+				// of its own when this is present.
+				free_mw:   budget.measured ? budget.free : null,
+				// What the PDs are entitled to draw by class, which is well
+				// above actual draw: an idle 802.3at PD still books 30 W.
+				allocated_mw: pse_attr('power_allocated'),
+				used_mw:   used,
+				free_pct:  b > 0 ? budget.free * 100 / b : 0,
+				faults:    faults,
+				temps:     temperatures(),
+				fans:      fans(),
+				led_mode:  trim(readfile('/var/run/led-mode') ?? '') || 'speed',
+				has_led_mode: length(readfile('/usr/sbin/led-mode') ?? '') > 0,
+			};
+		}
+	},
+
+	// Its own method: the status page include wants this without paying for
+	// a round trip per port.
+	getBoard: {
+		call: function() {
+			return board();
+		}
+	},
+
+	// Cable diagnostics. The PHY drops the link to run TDR, so testing a port
+	// that is up will bounce it; the page says so before starting one. ethtool
+	// emits a code entry and a length entry per pair, which are merged here.
+	cableTest: {
+		args: { port: 'lan1' },
+		call: function(req) {
+			const port = req.args?.port;
+
+			if (!port || !match(port, /^[a-z0-9_-]+$/))
+				return { success: false, error: 'bad port' };
+			if (!length(readfile(`/sys/class/net/${port}/operstate`) ?? ''))
+				return { success: false, error: 'no such port' };
+
+			const fd = popen(`ethtool --json --cable-test ${port} 2>/dev/null`, 'r');
+			if (!fd)
+				return { success: false, error: 'cannot run ethtool' };
+
+			const out = fd.read('all') ?? '';
+			fd.close();
+
+			let parsed;
+			try {
+				parsed = json(out);
+			} catch (e) {
+				parsed = null;
+			}
+
+			if (type(parsed) != 'array' || !length(parsed))
+				return { success: false, error: 'no result' };
+
+			let pairs = {};
+			for (let e in parsed) {
+				if (!e.pair)
+					continue;
+				pairs[e.pair] ??= { pair: e.pair };
+				if (e.code != null)
+					pairs[e.pair].code = e.code;
+				if (e.length != null)
+					pairs[e.pair].metres = e.length;
+			}
+
+			return { success: true, port: port, pairs: values(pairs) };
+		}
+	},
+
+	setPoe: {
+		args: { port: 'lan1', enable: true },
+		call: function(req) {
+			const port = req.args?.port;
+			const enable = req.args?.enable ? true : false;
+
+			if (!port || !match(port, /^[a-z0-9_-]+$/))
+				return { success: false, error: 'bad port' };
+
+			// Apply now...
+			const verb = enable ? 'enable' : 'disable';
+			system(`ethtool --set-pse ${port} c33-pse-admin-control ${verb} 2>/dev/null`);
+
+			// ...and persist, so it survives a reboot.
+			const sid = device_section(port);
+			if (sid) {
+				uci.set('network', sid, 'pse', enable ? '1' : '0');
+				uci.commit('network');
+			}
+
+			return { success: true, port: port, enabled: enable, persisted: sid != null };
+		}
+	},
+
+	// Power limit in mW. The ranges ethtool reports are what the MCU accepts;
+	// it clamps anything outside them rather than failing, so report back what
+	// the port ends up with.
+	setLimit: {
+		args: { port: 'lan1', limit_mw: 30000 },
+		call: function(req) {
+			const port = req.args?.port;
+			const mw = +(req.args?.limit_mw ?? 0);
+
+			if (!port || !match(port, /^[a-z0-9_-]+$/))
+				return { success: false, error: 'bad port' };
+			if (mw <= 0 || mw > 100000)
+				return { success: false, error: 'limit out of range' };
+
+			const rc = system(`ethtool --set-pse ${port} c33-pse-avail-pw-limit ${mw} 2>/dev/null`);
+
+			const sid = device_section(port);
+			if (sid) {
+				uci.set('network', sid, 'pse_power_limit', `${mw}`);
+				uci.commit('network');
+			}
+
+			const now = read_port(port);
+
+			return { success: rc == 0, port: port, limit_mw: now?.limit_mw,
+				 persisted: sid != null };
+		}
+	},
+
+	// 0 is the highest priority. What the maximum is comes from the port's own
+	// "Max allowed priority", so the UI does not have to guess.
+	setPriority: {
+		args: { port: 'lan1', priority: 0 },
+		call: function(req) {
+			const port = req.args?.port;
+			const prio = +(req.args?.priority ?? -1);
+
+			if (!port || !match(port, /^[a-z0-9_-]+$/))
+				return { success: false, error: 'bad port' };
+			if (prio < 0 || prio > 15)
+				return { success: false, error: 'priority out of range' };
+
+			const rc = system(`ethtool --set-pse ${port} prio ${prio} 2>/dev/null`);
+
+			const sid = device_section(port);
+			if (sid) {
+				uci.set('network', sid, 'pse_priority', `${prio}`);
+				uci.commit('network');
+			}
+
+			const now = read_port(port);
+
+			return { success: rc == 0, port: port, priority: now?.priority,
+				 persisted: sid != null };
+		}
+	},
+
+	// Widens the PD detection window to admit pre-802.3af devices, along
+	// with the signatures a faulty port can present, so the kernel keeps it
+	// opt-in and root-only. netifd does not know it, so poe-detect reapplies
+	// the uci copy at boot.
+	setLegacy: {
+		args: { port: 'lan1', enable: true },
+		call: function(req) {
+			const port = req.args?.port;
+			const enable = req.args?.enable ? true : false;
+
+			if (!port || !match(port, /^[a-z0-9_-]+$/))
+				return { success: false, error: 'bad port' };
+
+			const idx = pse_port_index(port);
+			if (idx == null)
+				return { success: false, error: 'not a PSE port' };
+
+			const path = pse_attr_path(`port${idx}/detection_legacy`);
+			if (!path)
+				return { success: false, error: 'not supported' };
+
+			const fd = open(path, 'w');
+			if (!fd)
+				return { success: false, error: 'cannot write' };
+
+			fd.write(enable ? '1\n' : '0\n');
+			fd.close();
+
+			const sid = device_section(port);
+			if (sid) {
+				uci.set('network', sid, 'pse_detection_legacy', enable ? '1' : '0');
+				uci.commit('network');
+			}
+
+			return { success: true, port: port, legacy: port_legacy(port),
+				 persisted: sid != null };
+		}
+	},
+
+	// ALDPS lets the PHY sleep while the link is down. It stops the RXC clock,
+	// which is why the driver keeps it opt-in; behind SerDes that does not
+	// apply, but it stays a per-port choice. port-extras reapplies it at boot.
+	setAldps: {
+		args: { port: 'lan1', enable: true },
+		call: function(req) {
+			const port = req.args?.port;
+			const enable = req.args?.enable ? true : false;
+
+			if (!port || !match(port, /^[a-z0-9_-]+$/))
+				return { success: false, error: 'bad port' };
+
+			const d = phy_path(port);
+			if (!d || port_aldps(port) == null)
+				return { success: false, error: 'not supported' };
+
+			const path = `${d}/aldps`;
+
+			const fd = open(path, 'w');
+			if (!fd)
+				return { success: false, error: 'cannot write' };
+
+			fd.write(enable ? '1\n' : '0\n');
+			fd.close();
+
+			const sid = device_section(port);
+			if (sid) {
+				uci.set('network', sid, 'phy_aldps', enable ? '1' : '0');
+				uci.commit('network');
+			}
+
+			return { success: true, port: port, aldps: port_aldps(port),
+				 persisted: sid != null };
+		}
+	},
+
+	// EEE is a netifd device option, so persisting it is the same shape as the
+	// PoE ones. Left unset, netifd does not touch it and the PHY default stands.
+	setEee: {
+		args: { port: 'lan1', enable: true },
+		call: function(req) {
+			const port = req.args?.port;
+			const enable = req.args?.enable ? true : false;
+
+			if (!port || !match(port, /^[a-z0-9_-]+$/))
+				return { success: false, error: 'bad port' };
+
+			const rc = system(`ethtool --set-eee ${port} eee ${enable ? 'on' : 'off'} 2>/dev/null`);
+
+			const sid = device_section(port);
+			if (sid) {
+				uci.set('network', sid, 'eee', enable ? '1' : '0');
+				uci.commit('network');
+			}
+
+			return { success: rc == 0, port: port, eee: port_eee(port),
+				 persisted: sid != null };
+		}
+	},
+
+	setLedMode: {
+		args: { mode: 'speed' },
+		call: function(req) {
+			const mode = req.args?.mode;
+
+			if (mode != 'speed' && mode != 'poe' && mode != 'off' && mode != 'toggle')
+				return { success: false, error: 'bad mode' };
+
+			const rc = system(`/usr/sbin/led-mode ${mode} 2>/dev/null`);
+
+			return {
+				success: rc == 0,
+				mode: trim(readfile('/var/run/led-mode') ?? '') || 'speed',
+			};
+		}
+	},
+};
+
+return { 'luci.poe': methods };
