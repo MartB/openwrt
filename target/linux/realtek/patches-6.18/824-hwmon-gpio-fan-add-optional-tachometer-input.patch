@@ -1,0 +1,236 @@
+From: Martin Boeh <martin@familie-boeh.de>
+Subject: [PATCH] hwmon: gpio-fan: add optional tachometer input
+
+gpio-fan reports fan1_input from the speed map, so it reflects what the
+fan was told to do rather than what it does. A stalled fan reads the
+same as a healthy one.
+
+Boards that gate a fan with a GPIO commonly route its tachometer to a
+second GPIO. pwm-fan already counts such an input, but it needs a PWM
+this class of board does not have.
+
+Count the edges and turn them into an RPM once a second, the same way
+pwm-fan does. When a tachometer is present fan1_input becomes the
+measured speed, fan1_target keeps reporting the requested one, and
+fan1_fault appears: it is set when the fan was asked to turn and no
+edges arrived, which is the condition worth acting on.
+
+Signed-off-by: Martin Boeh <martin@familie-boeh.de>
+---
+--- a/Documentation/devicetree/bindings/hwmon/gpio-fan.yaml
++++ b/Documentation/devicetree/bindings/hwmon/gpio-fan.yaml
+@@ -23,6 +23,15 @@
+   alarm-gpios:
+     maxItems: 1
+ 
++  interrupts:
++    maxItems: 1
++    description: Interrupt raised by the fan's tachometer output.
++
++  pulses-per-revolution:
++    $ref: /schemas/types.yaml#/definitions/uint32
++    default: 2
++    description: Number of interrupts the tachometer raises per revolution.
++
+   fan-supply:
+     description: Power supply for fan
+ 
+--- a/drivers/hwmon/gpio-fan.c
++++ b/drivers/hwmon/gpio-fan.c
+@@ -20,6 +20,7 @@
+ #include <linux/gpio/consumer.h>
+ #include <linux/of.h>
+ #include <linux/of_platform.h>
++#include <linux/property.h>
+ #include <linux/pm.h>
+ #include <linux/pm_runtime.h>
+ #include <linux/regulator/consumer.h>
+@@ -46,6 +47,14 @@
+ 	struct gpio_desc	*alarm_gpio;
+ 	struct work_struct	alarm_work;
+ 	struct regulator	*supply;
++	int			tach_irq;
++	unsigned int		tach_ppr;
++	unsigned int		tach_rpm;
++	bool			tach_fault;
++	atomic_t		tach_pulses;
++	ktime_t			tach_sample_start;
++	struct timer_list	tach_timer;
++	struct work_struct	tach_work;
+ };
+ 
+ /*
+@@ -101,6 +110,102 @@
+ }
+ 
+ /*
++ * Tachometer input.
++ */
++
++static irqreturn_t fan_tach_irq_handler(int irq, void *dev_id)
++{
++	struct gpio_fan_data *fan_data = dev_id;
++
++	atomic_inc(&fan_data->tach_pulses);
++
++	return IRQ_HANDLED;
++}
++
++static void fan_tach_notify(struct work_struct *ws)
++{
++	struct gpio_fan_data *fan_data =
++		container_of(ws, struct gpio_fan_data, tach_work);
++
++	sysfs_notify(&fan_data->hwmon_dev->kobj, NULL, "fan1_fault");
++	kobject_uevent(&fan_data->hwmon_dev->kobj, KOBJ_CHANGE);
++}
++
++static void fan_tach_sample(struct timer_list *t)
++{
++	struct gpio_fan_data *fan_data = timer_container_of(fan_data, t,
++							    tach_timer);
++	unsigned int delta = ktime_ms_delta(ktime_get(),
++					    fan_data->tach_sample_start);
++	bool fault, want_spin = true;
++	int pulses;
++
++	if (delta) {
++		pulses = atomic_xchg(&fan_data->tach_pulses, 0);
++		fan_data->tach_rpm = (unsigned int)(pulses * 1000 * 60) /
++				     (fan_data->tach_ppr * delta);
++		fan_data->tach_sample_start = ktime_get();
++
++		/* The map's lowest entry may still be a spinning fan. */
++		if (fan_data->speed)
++			want_spin = fan_data->speed[fan_data->speed_index].rpm > 0;
++
++		fault = want_spin && fan_data->tach_rpm == 0;
++		if (fault != fan_data->tach_fault) {
++			fan_data->tach_fault = fault;
++			schedule_work(&fan_data->tach_work);
++		}
++	}
++
++	mod_timer(&fan_data->tach_timer, jiffies + HZ);
++}
++
++static ssize_t fan1_fault_show(struct device *dev,
++			       struct device_attribute *attr, char *buf)
++{
++	struct gpio_fan_data *fan_data = dev_get_drvdata(dev);
++
++	return sprintf(buf, "%d\n", fan_data->tach_fault);
++}
++
++static DEVICE_ATTR_RO(fan1_fault);
++
++static void fan_tach_stop(void *data)
++{
++	struct gpio_fan_data *fan_data = data;
++
++	timer_delete_sync(&fan_data->tach_timer);
++	cancel_work_sync(&fan_data->tach_work);
++}
++
++static int fan_tach_init(struct gpio_fan_data *fan_data)
++{
++	struct device *dev = fan_data->dev;
++	int err;
++
++	fan_data->tach_ppr = 2;
++	device_property_read_u32(dev, "pulses-per-revolution",
++				 &fan_data->tach_ppr);
++	if (!fan_data->tach_ppr) {
++		dev_err(dev, "pulses-per-revolution can't be zero\n");
++		return -EINVAL;
++	}
++
++	INIT_WORK(&fan_data->tach_work, fan_tach_notify);
++
++	err = devm_request_irq(dev, fan_data->tach_irq, fan_tach_irq_handler,
++			       IRQF_NO_THREAD, "gpio-fan tach", fan_data);
++	if (err)
++		return err;
++
++	fan_data->tach_sample_start = ktime_get();
++	timer_setup(&fan_data->tach_timer, fan_tach_sample, 0);
++	mod_timer(&fan_data->tach_timer, jiffies + HZ);
++
++	return devm_add_action_or_reset(dev, fan_tach_stop, fan_data);
++}
++
++/*
+  * Control GPIOs.
+  */
+ 
+@@ -283,6 +388,17 @@
+ {
+ 	struct gpio_fan_data *fan_data = dev_get_drvdata(dev);
+ 
++	if (fan_data->tach_irq > 0)
++		return sprintf(buf, "%d\n", fan_data->tach_rpm);
++
++	return sprintf(buf, "%d\n", fan_data->speed[fan_data->speed_index].rpm);
++}
++
++static ssize_t fan1_target_show(struct device *dev,
++				struct device_attribute *attr, char *buf)
++{
++	struct gpio_fan_data *fan_data = dev_get_drvdata(dev);
++
+ 	return sprintf(buf, "%d\n", fan_data->speed[fan_data->speed_index].rpm);
+ }
+ 
+@@ -317,7 +433,7 @@
+ static DEVICE_ATTR_RO(fan1_min);
+ static DEVICE_ATTR_RO(fan1_max);
+ static DEVICE_ATTR_RO(fan1_input);
+-static DEVICE_ATTR(fan1_target, 0644, fan1_input_show, set_rpm);
++static DEVICE_ATTR(fan1_target, 0644, fan1_target_show, set_rpm);
+ 
+ static umode_t gpio_fan_is_visible(struct kobject *kobj,
+ 				   struct attribute *attr, int index)
+@@ -327,6 +443,11 @@
+ 
+ 	if (index == 0 && !data->alarm_gpio)
+ 		return 0;
++	if (index == 8)
++		return data->tach_irq > 0 ? attr->mode : 0;
++	/* A tachometer alone is enough to report a speed. */
++	if (index == 4 && data->tach_irq > 0)
++		return attr->mode;
+ 	if (index > 0 && !data->gpios)
+ 		return 0;
+ 
+@@ -342,6 +463,7 @@
+ 	&dev_attr_fan1_target.attr,
+ 	&dev_attr_fan1_min.attr,
+ 	&dev_attr_fan1_max.attr,
++	&dev_attr_fan1_fault.attr,		/* 8 */
+ 	NULL
+ };
+ 
+@@ -545,6 +667,10 @@
+ 	if (err)
+ 		return err;
+ 
++	fan_data->tach_irq = platform_get_irq_optional(pdev, 0);
++	if (fan_data->tach_irq == -EPROBE_DEFER)
++		return fan_data->tach_irq;
++
+ 	platform_set_drvdata(pdev, fan_data);
+ 	mutex_init(&fan_data->lock);
+ 
+@@ -579,6 +705,12 @@
+ 		if (err)
+ 			return err;
+ 	}
++
++	if (fan_data->tach_irq > 0) {
++		err = fan_tach_init(fan_data);
++		if (err)
++			return err;
++	}
+ 
+ 	pm_runtime_set_suspended(&pdev->dev);
+ 	pm_runtime_enable(&pdev->dev);
