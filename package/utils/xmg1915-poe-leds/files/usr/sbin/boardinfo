@@ -1,0 +1,53 @@
+#!/bin/sh
+# /usr/sbin/boardinfo -- factory data from the MRD block.
+#
+# Serial, hardware version and product model, which the stock firmware shows and
+# OpenWrt otherwise drops. Read through the nvmem cells the device tree
+# declares, falling back to the raw mtd partition where those are unavailable.
+
+MRD_SERIAL_OFF=3922      # 0xf52
+MRD_HWVER_OFF=3938       # 0xf62
+MRD_MODEL_OFF=4016       # 0xfb0
+
+cell() {
+	local f
+	for f in /sys/bus/nvmem/devices/*/cells/$1@*; do
+		[ -r "$f" ] && { tr -d '\0' < "$f"; return 0; }
+	done
+	return 1
+}
+
+from_mtd() {
+	local mtd off len
+	mtd=$(sed -n 's/^\(mtd[0-9]*\):.*"mrd".*/\1/p' /proc/mtd)
+	[ -n "$mtd" ] || return 1
+	off="$1"; len="$2"
+	dd if="/dev/$mtd" bs=1 skip="$off" count="$len" 2>/dev/null | tr -d '\0'
+}
+
+field() {
+	cell "$1" || from_mtd "$2" "$3"
+}
+
+SERIAL=$(field serial $MRD_SERIAL_OFF 15)
+HWVER=$(field hwver  $MRD_HWVER_OFF  15)
+MODEL=$(field model  $MRD_MODEL_OFF  31)
+
+case "${1:-print}" in
+print)
+	printf 'serial:   %s\n' "${SERIAL:-unknown}"
+	printf 'hwver:    %s\n' "${HWVER:-unknown}"
+	printf 'model:    %s\n' "${MODEL:-unknown}"
+	;;
+cache)
+	# procd reads /tmp/sysinfo at boot; these names sit beside its own.
+	mkdir -p /tmp/sysinfo
+	[ -n "$SERIAL" ] && printf '%s\n' "$SERIAL" > /tmp/sysinfo/board_serial
+	[ -n "$HWVER" ]  && printf '%s\n' "$HWVER"  > /tmp/sysinfo/board_hwversion
+	[ -n "$MODEL" ]  && printf '%s\n' "$MODEL"  > /tmp/sysinfo/board_product
+	;;
+*)
+	echo "usage: ${0##*/} {print|cache}" >&2
+	exit 1
+	;;
+esac
