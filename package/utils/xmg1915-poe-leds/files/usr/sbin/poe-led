@@ -1,0 +1,235 @@
+#!/bin/sh
+# /usr/sbin/poe-led -- front-panel PoE indicator, and the port LEDs when the
+# panel is in PoE display mode.
+#
+# The PSE MCU has no interrupt and no bulk read: one "ethtool --show-pse lanN"
+# is about six request/response round trips over a 115200 baud UART. So the
+# expensive query is driven by carrier changes - the only thing that alters PoE
+# state - plus a slow re-read for the drifting budget gauge.
+#
+# Indicator, traced from ZyNOS: green with >= 20% of the budget free, amber
+# from 5% to 20%, red below that or on a fault. ZyNOS blanks it unless the
+# panel is in PoE display mode; BLANK_UNLESS_POE_MODE=1 follows the vendor.
+
+PORTS="${POE_LED_PORTS:-lan1 lan2 lan3 lan4 lan5 lan6 lan7 lan8}"
+SLOTS="${POE_LED_SLOTS:-0 1 2 3 8 9 10 11}"
+LED_GREEN="${POE_LED_GREEN:-/sys/class/leds/green:poe}"
+LED_RED="${POE_LED_RED:-/sys/class/leds/red:poe}"
+
+# The blue element ZyNOS never drove. Older images register it as :indicator.
+LED_BLUE="${POE_LED_BLUE:-}"
+if [ -z "$LED_BLUE" ]; then
+	for c in /sys/class/leds/blue:poe /sys/class/leds/:indicator; do
+		[ -e "$c/brightness" ] && { LED_BLUE=$c; break; }
+	done
+fi
+
+TICK="${POE_LED_TICK:-2}"                 # carrier watch, sysfs only
+GAUGE_INTERVAL="${POE_LED_GAUGE:-60}"     # forced budget re-read
+# How much of the budget the MCU says is left, in mW. Under dynamic power
+# management this tracks actual draw, so budget = available + what is drawn:
+# the gauge never has to be told the total. Empty on a kernel without the
+# attribute, and then BUDGET_MW is used instead.
+hw_available_mw() {
+	local f v
+	for f in /sys/bus/serial/devices/*/power_available; do
+		read -r v < "$f" 2>/dev/null || continue
+		[ -n "$v" ] && [ "$v" -gt 0 ] 2>/dev/null && { echo "$v"; return 0; }
+	done
+	return 1
+}
+
+# Fallback only, for a kernel without power_available. 130 W on this board.
+BUDGET_MW="${POE_BUDGET_MW:-$(uci -q get poe-led.main.budget_mw || echo 130000)}"
+ALERT_WHEN_OFF="${POE_LED_ALERT_WHEN_OFF:-$(uci -q get poe-led.main.alert_when_off || echo 1)}"
+INDICATOR="${POE_LED_INDICATOR:-$(uci -q get poe-led.main.indicator || echo gauge)}"
+BLANK_UNLESS_POE_MODE="${BLANK_UNLESS_POE_MODE:-0}"
+
+POKE=/sys/kernel/debug/rtl838x/sw_led
+STATE=/var/run/led-mode
+PIDFILE=/var/run/poe-led.pid
+# Per-port LED values, so led-mode can repaint without the MCU.
+LEDCACHE=/var/run/poe-led.leds
+
+set_led()  { [ -e "$1/brightness" ] && echo "$2" > "$1/brightness" 2>/dev/null; }
+poke_led() { [ -w "$POKE" ] && echo "$1 $2 $3" > "$POKE" 2>/dev/null; }
+
+# Cheap: sysfs only, and `read <` is a shell builtin, so no fork per port.
+carrier_signature() {
+	local p c sig=""
+	for p in $PORTS; do
+		c=0
+		[ -e "/sys/class/net/$p/carrier" ] &&
+			{ read -r c < "/sys/class/net/$p/carrier" 2>/dev/null || c=0; }
+		sig="$sig$c"
+	done
+	echo "$sig"
+}
+
+# Expensive: one MCU conversation per port, on a carrier change or the slow
+# timer, never on the tick. Numbers are anchored after their keyword, or
+# "Clause 33 PSE Power Class: 4" yields 33.
+evaluate() {
+	local p out slot class power used=0 fault=0 mode blue green red cache=""
+
+	mode=$(cat "$STATE" 2>/dev/null)
+
+	set -- $SLOTS
+	for p in $PORTS; do
+		slot=$1; shift
+		blue=0; green=0; red=0
+
+		if [ -d "/sys/class/net/$p" ] &&
+		   out=$(ethtool --show-pse "$p" 2>/dev/null); then
+
+			power=$(printf '%s\n' "$out" |
+				sed -n 's/.*[Aa]ctual[^0-9]*\([0-9][0-9]*\).*/\1/p' | head -1)
+			[ -n "$power" ] && used=$((used + power))
+
+			case "$(printf '%s\n' "$out" | grep -i 'detection status')" in
+			*[Ff]ault*) fault=1 ;;
+			*[Dd]elivering*)
+				class=$(printf '%s\n' "$out" |
+					sed -n 's/.*[Cc]lass[^0-9]*\([0-9][0-9]*\).*/\1/p' | head -1)
+				case "${class:-0}" in
+				0|1|2|3) green=7; red=7 ;;   # 802.3af -> yellow
+				4)       green=7 ;;          # 802.3at -> green
+				*)       blue=7 ;;           # 802.3bt -> blue
+				esac
+				;;
+			esac
+		fi
+
+		# In speed mode the port LEDs belong to the scan engine.
+		[ "$mode" = poe ] && {
+			poke_led "$slot" 0 "$blue"
+			poke_led "$slot" 1 "$green"
+			poke_led "$slot" 2 "$red"
+		}
+
+		cache="$cache$slot $blue $green $red
+"
+	done
+
+	# Published in either mode, so switching into PoE display is instant.
+	# Written whole then renamed, so a reader never sees half a file.
+	printf '%s' "$cache" > "$LEDCACHE.new" 2>/dev/null &&
+		mv "$LEDCACHE.new" "$LEDCACHE" 2>/dev/null
+
+	# Work out the critical condition first: dark mode blanks the panel but
+	# should not hide a faulted port or an exhausted budget.
+	#
+	# available / (available + used) is (budget - used) / budget, so the total
+	# cancels and never has to be known. Only the fallback, where there is no
+	# measured figure, depends on BUDGET_MW being right.
+	local avail free_pct
+	if avail=$(hw_available_mw); then
+		free_pct=$(( avail * 100 / (avail + used) ))
+	elif [ "${BUDGET_MW:-0}" -gt 0 ] 2>/dev/null; then
+		free_pct=$(( (BUDGET_MW - used) * 100 / BUDGET_MW ))
+	else
+		# Nothing to judge against: report healthy rather than a false alarm.
+		free_pct=100
+	fi
+	[ "$free_pct" -lt 0 ] && free_pct=0
+
+	local critical=0
+	[ "$fault" = 1 ] && critical=1
+	[ "$free_pct" -lt 5 ] && critical=1
+
+	if [ "$mode" = off ]; then
+		set_led "$LED_BLUE" 0
+		set_led "$LED_GREEN" 0
+		[ "$ALERT_WHEN_OFF" = 1 ] && set_led "$LED_RED" "$critical" ||
+			set_led "$LED_RED" 0
+		return
+	fi
+
+	# Blue marks PoE display mode, which is otherwise ambiguous: amber is
+	# 100M or 802.3af, green 1G or 802.3at. Gauge and mode share one lens,
+	# so they take turns rather than mixing into cyan.
+	if [ "$mode" = poe ]; then
+		set_led "$LED_BLUE" 1
+		set_led "$LED_GREEN" 0
+		set_led "$LED_RED" 0
+		return
+	fi
+
+	set_led "$LED_BLUE" 0
+
+	if [ "$BLANK_UNLESS_POE_MODE" = 1 ]; then
+		set_led "$LED_GREEN" 0
+		set_led "$LED_RED" 0
+		return
+	fi
+
+	case "$INDICATOR" in
+	off)
+		set_led "$LED_GREEN" 0
+		set_led "$LED_RED" 0
+		;;
+	active)
+		# Green whenever anything is drawing power; a fault still wins.
+		if [ "$fault" = 1 ]; then
+			set_led "$LED_GREEN" 0; set_led "$LED_RED" 1
+		elif [ "$used" -gt 0 ]; then
+			set_led "$LED_GREEN" 1; set_led "$LED_RED" 0
+		else
+			set_led "$LED_GREEN" 0; set_led "$LED_RED" 0
+		fi
+		;;
+	*)
+		# gauge: mirrors the stock firmware's budget thresholds
+		if   [ "$fault" = 1 ];       then set_led "$LED_GREEN" 0; set_led "$LED_RED" 1
+		elif [ "$free_pct" -lt 5 ];  then set_led "$LED_GREEN" 0; set_led "$LED_RED" 1
+		elif [ "$free_pct" -lt 20 ]; then set_led "$LED_GREEN" 1; set_led "$LED_RED" 1
+		else                              set_led "$LED_GREEN" 1; set_led "$LED_RED" 0
+		fi
+		;;
+	esac
+}
+
+# One-shot check so a label mismatch is loud rather than a gauge stuck at 0.
+selftest() {
+	local p first
+	for p in $PORTS; do
+		[ -d "/sys/class/net/$p" ] && { first=$p; break; }
+	done
+	[ -n "$first" ] || return 0
+	ethtool --show-pse "$first" 2>/dev/null | grep -qi actual || {
+		echo "poe-led: no 'actual power' line for $first; gauge will read 0." >&2
+		ethtool --show-pse "$first" 2>&1 | sed 's/^/poe-led:   /' >&2
+	}
+}
+
+cleanup() {
+	set_led "$LED_GREEN" 0
+	set_led "$LED_RED" 0
+	rm -f "$PIDFILE"
+	exit 0
+}
+
+echo $$ > "$PIDFILE"
+trap cleanup INT TERM
+# led-mode signals us after a mode change so the panel repaints at once
+trap 'FORCE=1' USR1
+
+selftest
+
+FORCE=1
+last_sig=""
+countdown=0
+
+while :; do
+	sig=$(carrier_signature)
+
+	if [ "$FORCE" = 1 ] || [ "$sig" != "$last_sig" ] || [ "$countdown" -le 0 ]; then
+		FORCE=0
+		last_sig=$sig
+		countdown=$GAUGE_INTERVAL
+		evaluate
+	fi
+
+	countdown=$((countdown - TICK))
+	sleep "$TICK"
+done

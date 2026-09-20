@@ -1,0 +1,22 @@
+config poe-led 'main'
+	# Front-panel LED mode restored at boot: speed, poe or off
+	option mode 'speed'
+
+	# Fallback total PoE budget in mW, used only when the driver has no
+	# power_available attribute. The MCU reports what is left rather than the
+	# total, so normally the total is derived and this is ignored. 130 W here.
+	option budget_mw '130000'
+
+	# Keep the PWR LED lit in 'off' mode, so the unit does not look dead
+	option keep_power '0'
+
+	# What the PoE indicator shows in speed mode:
+	#   gauge  - green >=20% budget free, amber 5-20%, red below 5%
+	#   active - green whenever any port is delivering, dark otherwise
+	#   off    - never lit
+	option indicator 'gauge'
+
+	# Show red on the PoE indicator even in 'off' mode when a port has
+	# faulted or the budget is nearly gone. Dark mode should not hide a
+	# fault you would want to see.
+	option alert_when_off '1'

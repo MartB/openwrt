@@ -1,0 +1,22 @@
+#!/bin/sh
+# /etc/rc.button/BTN_1 -- the front-panel "LED mode" button (gpio0 11).
+#
+# gpio-button-hotplug maps BTN_1 to the literal name "BTN_1" (see button_map[]
+# in package/kernel/gpio-button-hotplug), so this filename is correct; procd
+# runs it with ACTION=pressed then ACTION=released.
+#
+# Logs what it did, so `logread | grep led-mode` distinguishes "the button
+# never fired" from "it fired and the toggle failed".
+
+# procd runs hotplug scripts with a minimal environment; led-mode needs
+# ethtool, which lives in /usr/sbin.
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+[ "$ACTION" = released ] || exit 0
+
+if out=$(/usr/sbin/led-mode toggle 2>&1); then
+	logger -t led-mode "button: now $(/usr/sbin/led-mode status)"
+else
+	logger -t led-mode "button: toggle failed: $out"
+fi
