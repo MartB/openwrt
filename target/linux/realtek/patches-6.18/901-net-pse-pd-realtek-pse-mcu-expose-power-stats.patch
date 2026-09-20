@@ -1,0 +1,174 @@
+From: OpenWrt local
+Subject: net: pse-pd: realtek-pse-mcu: expose the MCU's power figures
+
+The GET_POWER_STATUS reply (0x41 gen2, 0x23 gen1) carries two totals for
+the controller, but the driver only reads it before changing the global
+budget. Expose both in mW.
+
+The stock firmware's diagnostic labels them "Total Power Allocated" and
+"Available Power", followed by the active power bank; neither is the total
+budget. power_allocated is what the MCU has reserved for the powered ports:
+the class power for a port on the default limit, and the configured limit
+for a port with a user-defined one. On an XMG1915-10EP one class 4 port on
+the default limit reads 30000, and setting that port's limit to 32800 moves
+it to 32800; a class 4 and a class 3 port with 60 W limits read 120000.
+power_available is how much of the budget is left, which under dynamic
+power management tracks actual draw, so the budget is available + actual
+draw and a consumer that knows the per-port draw can derive it.
+
+This is an OpenWrt-local addition on top of the upstream driver.
+
+--- a/drivers/net/pse-pd/realtek-pse-mcu-core.c
++++ b/drivers/net/pse-pd/realtek-pse-mcu-core.c
+@@ -131,6 +131,29 @@ struct rtpse_mcu_port_status {
+ 	u8 sts3;
+ };
+ 
++/*
++ * The first two totals in the GET_POWER_STATUS reply. The ZyNOS diagnostic
++ * that dumps this reply labels them "Total Power Allocated" and "Available
++ * Power", followed by the active power bank in payload[4]; neither total is
++ * the configured budget:
++ *
++ *   allocated - what the MCU has reserved for the powered ports: the class
++ *               power for a port on the default limit, so an idle 802.3at PD
++ *               still counts for its full 30 W, and the configured limit for
++ *               a port with a user-defined one
++ *   available - how much of the budget is left. Under dynamic power
++ *               management this tracks *actual* draw, not the allocation, so
++ *               it moves as the PDs do
++ *
++ * The budget itself is not in this reply; it is available + actual draw.
++ * (The figures ZyNOS shows users as "Allocated Power" and "Remaining Power"
++ * are computed on the host and do not come from this reply at all.)
++ */
++struct rtpse_mcu_power_stats {
++	u16 allocated_raw;	/* 100mW/LSB */
++	u16 available_raw;	/* 100mW/LSB */
++};
++
+ struct rtpse_mcu_port_measurement {
+ 	u16 voltage_raw;	/* 64.45mV/LSB */
+ 	u16 current_raw;	/* 1mA/LSB */
+@@ -385,6 +408,28 @@ static int rtpse_mcu_get_info(struct rtp
+ 	return 0;
+ }
+ 
++static int rtpse_mcu_get_power_stats(struct rtpse_mcu_ctrl *pse,
++				     struct rtpse_mcu_power_stats *stats)
++{
++	struct rtpse_mcu_msg req, resp;
++	const struct rtpse_mcu_opcode *opc;
++	int ret;
++
++	opc = &pse->dialect->opcode[RTPSE_MCU_CMD_GET_POWER_STATUS];
++	if (!opc->valid)
++		return -EOPNOTSUPP;
++
++	rtpse_mcu_msg_init(&req, opc->op);
++	ret = rtpse_mcu_do_xfer(pse, &req, &resp);
++	if (ret)
++		return ret;
++
++	stats->allocated_raw = get_unaligned_be16(&resp.payload[0]);
++	stats->available_raw = get_unaligned_be16(&resp.payload[2]);
++
++	return 0;
++}
++
+ static int rtpse_mcu_get_ext_config(struct rtpse_mcu_ctrl *pse, struct rtpse_mcu_ext_config *config)
+ {
+ 	struct rtpse_mcu_msg req, resp;
+@@ -1019,6 +1064,81 @@ static ssize_t detection_legacy_store(st
+ 	return count;
+ }
+ 
++/*
++ * A device_attribute carrying its controller, so these do not need drvdata:
++ * that belongs to the transport driver.
++ */
++struct rtpse_mcu_ctrl_attr {
++	struct device_attribute attr;
++	struct rtpse_mcu_ctrl *pse;
++};
++
++struct rtpse_mcu_ctrl_sysfs {
++	struct rtpse_mcu_ctrl_attr power_allocated;
++	struct rtpse_mcu_ctrl_attr power_available;
++	struct attribute *attrs[3];
++	struct attribute_group group;
++};
++
++/* Both files report mW. */
++static ssize_t rtpse_mcu_power_show(struct device_attribute *attr, char *buf, bool available)
++{
++	struct rtpse_mcu_ctrl_attr *ca =
++		container_of(attr, struct rtpse_mcu_ctrl_attr, attr);
++	struct rtpse_mcu_power_stats stats;
++	int ret;
++
++	ret = rtpse_mcu_get_power_stats(ca->pse, &stats);
++	if (ret)
++		return ret;
++
++	return sysfs_emit(buf, "%u\n",
++			  (available ? stats.available_raw : stats.allocated_raw) * 100U);
++}
++
++static ssize_t power_allocated_show(struct device *dev, struct device_attribute *attr,
++				    char *buf)
++{
++	return rtpse_mcu_power_show(attr, buf, false);
++}
++
++static ssize_t power_available_show(struct device *dev, struct device_attribute *attr,
++				    char *buf)
++{
++	return rtpse_mcu_power_show(attr, buf, true);
++}
++
++static int rtpse_mcu_power_sysfs_init(struct rtpse_mcu_ctrl *pse)
++{
++	struct rtpse_mcu_ctrl_sysfs *cs;
++
++	if (!pse->dialect->opcode[RTPSE_MCU_CMD_GET_POWER_STATUS].valid)
++		return 0;
++
++	cs = devm_kzalloc(pse->dev, sizeof(*cs), GFP_KERNEL);
++	if (!cs)
++		return -ENOMEM;
++
++	sysfs_attr_init(&cs->power_allocated.attr.attr);
++	cs->power_allocated.attr.attr.name = "power_allocated";
++	cs->power_allocated.attr.attr.mode = 0444;
++	cs->power_allocated.attr.show = power_allocated_show;
++	cs->power_allocated.pse = pse;
++
++	sysfs_attr_init(&cs->power_available.attr.attr);
++	cs->power_available.attr.attr.name = "power_available";
++	cs->power_available.attr.attr.mode = 0444;
++	cs->power_available.attr.show = power_available_show;
++	cs->power_available.pse = pse;
++
++	cs->attrs[0] = &cs->power_allocated.attr.attr;
++	cs->attrs[1] = &cs->power_available.attr.attr;
++	cs->attrs[2] = NULL;
++	cs->group.attrs = cs->attrs;
++
++	return devm_device_add_group(pse->dev, &cs->group);
++}
++
+ static int rtpse_mcu_sysfs_init(struct rtpse_mcu_ctrl *pse)
+ {
+ 	unsigned int n = pse->pcdev.nr_lines, i;
+@@ -1258,6 +1378,10 @@ int rtpse_mcu_register(struct rtpse_mcu_
+ 	if (ret)
+ 		goto err_restore_budget;
+ 
++	ret = rtpse_mcu_power_sysfs_init(pse);
++	if (ret)
++		goto err_restore_budget;
++
+ 	return 0;
+ 
+ err_restore_budget:
