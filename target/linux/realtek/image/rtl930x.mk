@@ -455,3 +455,13 @@ define Device/zyxel_xmg1915-10ep
   DEVICE_PACKAGES += kmod-pse-realtek-mcu-uart
 endef
 TARGET_DEVICES += zyxel_xmg1915-10ep
+
+# UNTESTED. Reconstructed from the stock firmware, which is one image shared
+# by the 10E, 10EP and 18EP; see the header of the .dts for what is measured
+# and what is inferred.
+define Device/zyxel_xmg1915-18ep
+  DEVICE_MODEL := XMG1915-18EP
+  $(Device/zyxel_xmg1915)
+  DEVICE_PACKAGES += kmod-pse-realtek-mcu-uart kmod-hwmon-tmp103 kmod-i2c-gpio
+endef
+TARGET_DEVICES += zyxel_xmg1915-18ep

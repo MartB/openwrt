@@ -1,0 +1,262 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+/dts-v1/;
+
+#include "rtl9302_zyxel_xmg1915-common.dtsi"
+#include "rtl9302_zyxel_xmg1915-poe.dtsi"
+
+#include <dt-bindings/input/input.h>
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/interrupt-controller/irq.h>
+#include <dt-bindings/leds/common.h>
+#include <dt-bindings/thermal/thermal.h>
+
+/*
+ * Zyxel XMG1915-18EP: 16x 2.5G copper (PoE on the first 8) + 2x SFP+.
+ *
+ * UNTESTED. Reconstructed from the stock firmware, which ships one image for
+ * the 10E, 10EP and 18EP; the same extraction run against the 10EP reproduces
+ * that board's known-good device tree exactly. That is not the same as having
+ * verified this one.
+ *
+ * Least certain, and the first things to check on hardware: the SoC
+ * compatible, assumed to match the 10EP because the firmware reads the chip id
+ * at runtime rather than storing it per model, and the indicator LED colours.
+ * Their position is not a guess -- the scan chain is indexed by raw port
+ * number, and ports 20-23 are real copper here, so all four indicators sit on
+ * port 24 instead of the 10EP's 23 and 24.
+ */
+
+/ {
+	compatible = "zyxel,xmg1915-18ep", "realtek,rtl9302c-soc";
+	model = "Zyxel XMG1915-18EP Switch";
+
+	led_set: led_set {
+		compatible = "realtek,rtl9300-leds";
+		active-low;
+
+		/* Copper */
+		led_set0 = <(RTL93XX_LED_SET_100M | RTL93XX_LED_SET_LINK |
+			     RTL93XX_LED_SET_ACT)
+			    (RTL93XX_LED_SET_100M |RTL93XX_LED_SET_1G |
+			     RTL93XX_LED_SET_2P5G | RTL93XX_LED_SET_LINK |
+			     RTL93XX_LED_SET_ACT)
+			    (RTL93XX_LED_SET_2P5G | RTL93XX_LED_SET_LINK |
+			     RTL93XX_LED_SET_ACT)>;
+		/* SFP+ */
+		led_set1 = <(RTL93XX_LED_SET_1G | RTL93XX_LED_SET_2P5G |
+			     RTL93XX_LED_SET_LINK | RTL93XX_LED_SET_ACT)
+			     (RTL93XX_LED_SET_10G | RTL93XX_LED_SET_2P5G |
+			     RTL93XX_LED_SET_LINK | RTL93XX_LED_SET_ACT)>;
+
+		/*
+		 * CLOUD and the PoE indicator, driven by software below, so
+		 * these contents never reach the panel. Four LEDs must still
+		 * be declared for the port to get four chain slots.
+		 */
+		led_set2 = <(RTL93XX_LED_SET_LINK) (RTL93XX_LED_SET_LINK)
+			    (RTL93XX_LED_SET_LINK) (RTL93XX_LED_SET_LINK)>;
+
+		realtek,led-set2-force-port-mask = <0x01000000>;
+
+		software-leds {
+			#address-cells = <2>;
+			#size-cells = <0>;
+
+			led@18,0 {
+				reg = <24 0>;
+				color = <LED_COLOR_ID_GREEN>;
+				function = "cloud";
+			};
+
+			led@18,1 {
+				reg = <24 1>;
+				color = <LED_COLOR_ID_BLUE>;
+				function = "poe";
+			};
+
+			led@18,2 {
+				reg = <24 2>;
+				color = <LED_COLOR_ID_GREEN>;
+				function = "poe";
+			};
+
+			led@18,3 {
+				reg = <24 3>;
+				color = <LED_COLOR_ID_RED>;
+				function = "poe";
+			};
+		};
+	};
+
+	/*
+	 * The board sensor hangs off two GPIOs rather than the switch's i2c
+	 * master. Pin 11 is the LED-mode button on the 10EP; here it is this
+	 * bus's data line, which is why this model has no such button.
+	 */
+	i2c_tmp103: i2c-gpio {
+		compatible = "i2c-gpio";
+		sda-gpios = <&gpio0 11 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
+		scl-gpios = <&gpio0 8 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
+		i2c-gpio,delay-us = <10>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		/* "CPU/MAC" in the stock firmware; the address is hard wired. */
+		board_temp: tmp103@70 {
+			compatible = "ti,tmp103";
+			reg = <0x70>;
+		};
+	};
+
+	/*
+	 * GPIO 18 selects full rate rather than switching the fan off, so
+	 * neither speed-map entry may be 0 RPM: that would let the thermal
+	 * core try to stop a fan that cannot stop. GPIO 19 is the tachometer,
+	 * armed on both edges, so four edges per revolution for a two pulse
+	 * fan. The speeds are nominal; fan1_input reports what it measures.
+	 */
+	fan: gpio-fan {
+		compatible = "gpio-fan";
+		gpios = <&gpio0 18 GPIO_ACTIVE_HIGH>;
+		gpio-fan,speed-map = <3000 0>, <6000 1>;
+		interrupt-parent = <&gpio0>;
+		interrupts = <19 IRQ_TYPE_EDGE_BOTH>;
+		pulses-per-revolution = <4>;
+		#cooling-cells = <2>;
+	};
+
+};
+
+/*
+ * Stock has no temperature input in its fan path: it boosts once an SFP is
+ * present and only drops back when the feature is switched off. Drive the
+ * boost from the SoC sensor instead, which covers PoE load as well.
+ *
+ * The TMP103 is deliberately left out of the loop. It measures the same area,
+ * so a second uncalibrated trip would control the same thing, and guessing it
+ * low would pin the fan on for good. It is exposed as a sensor only.
+ */
+&thermal_zones {
+	cpu-thermal {
+		trips {
+			cpu_fan_trip: cpu-fan-trip {
+				temperature = <70000>;
+				hysteresis = <5000>;
+				type = "active";
+			};
+		};
+
+		cooling-maps {
+			map {
+				trip = <&cpu_fan_trip>;
+				cooling-device = <&fan THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+			};
+		};
+	};
+
+};
+
+/*
+ * GPIO 2 is a global PHY reset shared by all four MDIO busses. Deliberately
+ * not declared as reset-gpios anywhere: the binding only has a per-bus reset,
+ * and attaching it to one bus would reset the PHYs on the others behind their
+ * drivers' backs.
+ */
+&mdio_bus2 {
+	/* External RTL8224 PHY */
+	phy16: ethernet-phy@8 {
+		reg = <8>;
+		compatible = "ethernet-phy-ieee802.3-c45";
+		enet-phy-pair-order = <0>;
+		enet-phy-pair-polarity = <0>;
+	};
+	phy17: ethernet-phy@9 {
+		reg = <9>;
+		compatible = "ethernet-phy-ieee802.3-c45";
+		enet-phy-pair-order = <0>;
+		enet-phy-pair-polarity = <0>;
+	};
+	phy18: ethernet-phy@10 {
+		reg = <10>;
+		compatible = "ethernet-phy-ieee802.3-c45";
+		enet-phy-pair-order = <1>;
+		enet-phy-pair-polarity = <0>;
+	};
+	phy19: ethernet-phy@11 {
+		reg = <11>;
+		compatible = "ethernet-phy-ieee802.3-c45";
+		enet-phy-pair-order = <1>;
+		enet-phy-pair-polarity = <0>;
+	};
+};
+
+&mdio_bus3 {
+	/* External RTL8224 PHY */
+	phy20: ethernet-phy@12 {
+		reg = <12>;
+		compatible = "ethernet-phy-ieee802.3-c45";
+		enet-phy-pair-order = <0>;
+		enet-phy-pair-polarity = <0>;
+	};
+	phy21: ethernet-phy@13 {
+		reg = <13>;
+		compatible = "ethernet-phy-ieee802.3-c45";
+		enet-phy-pair-order = <0>;
+		enet-phy-pair-polarity = <0>;
+	};
+	phy22: ethernet-phy@14 {
+		reg = <14>;
+		compatible = "ethernet-phy-ieee802.3-c45";
+		enet-phy-pair-order = <1>;
+		enet-phy-pair-polarity = <0>;
+	};
+	phy23: ethernet-phy@15 {
+		reg = <15>;
+		compatible = "ethernet-phy-ieee802.3-c45";
+		enet-phy-pair-order = <1>;
+		enet-phy-pair-polarity = <0>;
+	};
+};
+
+&switch0 {
+	ethernet-ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		/* Copper ports */
+		SWITCH_PORT_LED(0, 1, 2, 0, 0, 10g-qxgmii)
+		SWITCH_PORT_LED(1, 2, 2, 1, 0, 10g-qxgmii)
+		SWITCH_PORT_LED(2, 3, 2, 2, 0, 10g-qxgmii)
+		SWITCH_PORT_LED(3, 4, 2, 3, 0, 10g-qxgmii)
+		SWITCH_PORT_LED(8, 5, 3, 0, 0, 10g-qxgmii)
+		SWITCH_PORT_LED(9, 6, 3, 1, 0, 10g-qxgmii)
+		SWITCH_PORT_LED(10, 7, 3, 2, 0, 10g-qxgmii)
+		SWITCH_PORT_LED(11, 8, 3, 3, 0, 10g-qxgmii)
+		SWITCH_PORT_LED(16, 9, 4, 0, 0, 10g-qxgmii)
+		SWITCH_PORT_LED(17, 10, 4, 1, 0, 10g-qxgmii)
+		SWITCH_PORT_LED(18, 11, 4, 2, 0, 10g-qxgmii)
+		SWITCH_PORT_LED(19, 12, 4, 3, 0, 10g-qxgmii)
+		SWITCH_PORT_LED(20, 13, 5, 0, 0, 10g-qxgmii)
+		SWITCH_PORT_LED(21, 14, 5, 1, 0, 10g-qxgmii)
+		SWITCH_PORT_LED(22, 15, 5, 2, 0, 10g-qxgmii)
+		SWITCH_PORT_LED(23, 16, 5, 3, 0, 10g-qxgmii)
+
+		/* SFP+ cages */
+		SWITCH_PORT_SFP(25, 17, 7, 1, 0)
+		SWITCH_PORT_SFP(27, 18, 9, 1, 1)
+
+		port@28 {
+			ethernet = <&ethernet0>;
+			reg = <28>;
+			phy-mode = "internal";
+			fixed-link {
+				speed = <1000>;
+				full-duplex;
+			};
+		};
+	};
+};
+
+&pse {
+	compatible = "zyxel,xmg1915-18ep-pse", "realtek,pse-mcu-gen2";
+};
