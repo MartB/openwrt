@@ -1,0 +1,36 @@
+{
+	"luci-app-poe": {
+		"description": "Grant access to PoE status and control",
+		"read": {
+			"ubus": {
+				"luci.poe": [
+					"getStatus",
+					"getBoard"
+				]
+			},
+			"uci": [
+				"luci",
+				"network",
+				"poe-led"
+			]
+		},
+		"write": {
+			"ubus": {
+				"luci.poe": [
+					"setPoe",
+					"setLedMode",
+					"setLimit",
+					"setPriority",
+					"setEee",
+					"setLegacy",
+					"setAldps",
+					"cableTest"
+				]
+			},
+			"uci": [
+				"network",
+				"poe-led"
+			]
+		}
+	}
+}
