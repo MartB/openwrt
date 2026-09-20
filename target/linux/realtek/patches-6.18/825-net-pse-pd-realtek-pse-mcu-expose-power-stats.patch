@@ -1,0 +1,190 @@
+From: OpenWrt local
+Subject: net: pse-pd: realtek-pse-mcu: expose the MCU's power figures
+
+The MCU keeps two totals for the controller that the driver has no command
+for: the gen2 opcode table jumps from 0x40 to 0x4a. Add GET_POWER_STATS (0x41
+gen2, 0x23 gen1) and expose both in mW.
+
+They are named as the vendor firmware labels them, because neither is the
+total budget: power_allocated is what the attached PDs are entitled to draw by
+class, and power_available is how much of the budget is left, which under
+dynamic power management tracks actual draw. The budget is available + actual
+draw, so a consumer that knows the per-port draw can derive it rather than
+having it configured.
+
+This is an OpenWrt-local addition on top of the upstream driver.
+
+--- a/drivers/net/pse-pd/realtek-pse-mcu-core.c
++++ b/drivers/net/pse-pd/realtek-pse-mcu-core.c
+@@ -80,6 +80,7 @@ enum rtpse_mcu_cmd {
+ 	RTPSE_MCU_CMD_SET_GLOBAL_STATE,
+ 	RTPSE_MCU_CMD_GET_SYSTEM_INFO,
+ 	RTPSE_MCU_CMD_GET_EXT_CONFIG,
++	RTPSE_MCU_CMD_GET_POWER_STATS,
+ 	RTPSE_MCU_CMD_SET_POWER_MANAGEMENT_MODE,
+ 
+ 	RTPSE_MCU_CMD_PORT_ENABLE,
+@@ -123,6 +124,23 @@ struct rtpse_mcu_port_status {
+ 	u8 sts3;
+ };
+ 
++/*
++ * The two figures the MCU keeps for the whole controller. Named as the vendor
++ * firmware labels them, because neither is the total budget:
++ *
++ *   allocated - sum of what the attached PDs are entitled to draw by class,
++ *               so an idle 802.3at PD still counts for its full 30 W
++ *   available - how much of the budget is left. Under dynamic power
++ *               management this tracks *actual* draw, not the allocation, so
++ *               it moves as the PDs do
++ *
++ * The budget itself is not reported; it is available + actual draw.
++ */
++struct rtpse_mcu_power_stats {
++	u16 allocated_raw;	/* 100mW/LSB */
++	u16 available_raw;	/* 100mW/LSB */
++};
++
+ struct rtpse_mcu_port_measurement {
+ 	u16 voltage_raw;	/* 64.45mV/LSB */
+ 	u16 current_raw;	/* 1mA/LSB */
+@@ -377,6 +395,28 @@ static int rtpse_mcu_get_info(struct rtp
+ 	return 0;
+ }
+ 
++static int rtpse_mcu_get_power_stats(struct rtpse_mcu_ctrl *pse,
++				     struct rtpse_mcu_power_stats *stats)
++{
++	struct rtpse_mcu_msg req, resp;
++	const struct rtpse_mcu_opcode *opc;
++	int ret;
++
++	opc = &pse->dialect->opcode[RTPSE_MCU_CMD_GET_POWER_STATS];
++	if (!opc->valid)
++		return -EOPNOTSUPP;
++
++	rtpse_mcu_msg_init(&req, opc->op);
++	ret = rtpse_mcu_do_xfer(pse, &req, &resp);
++	if (ret)
++		return ret;
++
++	stats->allocated_raw = get_unaligned_be16(&resp.payload[0]);
++	stats->available_raw = get_unaligned_be16(&resp.payload[2]);
++
++	return 0;
++}
++
+ static int rtpse_mcu_get_ext_config(struct rtpse_mcu_ctrl *pse, struct rtpse_mcu_ext_config *config)
+ {
+ 	struct rtpse_mcu_msg req, resp;
+@@ -899,6 +939,81 @@ static ssize_t detection_legacy_store(st
+ 	return count;
+ }
+ 
++/*
++ * A device_attribute carrying its controller, so these do not need drvdata:
++ * that belongs to the transport driver.
++ */
++struct rtpse_mcu_ctrl_attr {
++	struct device_attribute attr;
++	struct rtpse_mcu_ctrl *pse;
++};
++
++struct rtpse_mcu_ctrl_sysfs {
++	struct rtpse_mcu_ctrl_attr power_allocated;
++	struct rtpse_mcu_ctrl_attr power_available;
++	struct attribute *attrs[3];
++	struct attribute_group group;
++};
++
++/* Both files report mW. */
++static ssize_t rtpse_mcu_power_show(struct device_attribute *attr, char *buf, bool available)
++{
++	struct rtpse_mcu_ctrl_attr *ca =
++		container_of(attr, struct rtpse_mcu_ctrl_attr, attr);
++	struct rtpse_mcu_power_stats stats;
++	int ret;
++
++	ret = rtpse_mcu_get_power_stats(ca->pse, &stats);
++	if (ret)
++		return ret;
++
++	return sysfs_emit(buf, "%u\n",
++			  (available ? stats.available_raw : stats.allocated_raw) * 100U);
++}
++
++static ssize_t power_allocated_show(struct device *dev, struct device_attribute *attr,
++				    char *buf)
++{
++	return rtpse_mcu_power_show(attr, buf, false);
++}
++
++static ssize_t power_available_show(struct device *dev, struct device_attribute *attr,
++				    char *buf)
++{
++	return rtpse_mcu_power_show(attr, buf, true);
++}
++
++static int rtpse_mcu_power_sysfs_init(struct rtpse_mcu_ctrl *pse)
++{
++	struct rtpse_mcu_ctrl_sysfs *cs;
++
++	if (!pse->dialect->opcode[RTPSE_MCU_CMD_GET_POWER_STATS].valid)
++		return 0;
++
++	cs = devm_kzalloc(pse->dev, sizeof(*cs), GFP_KERNEL);
++	if (!cs)
++		return -ENOMEM;
++
++	sysfs_attr_init(&cs->power_allocated.attr.attr);
++	cs->power_allocated.attr.attr.name = "power_allocated";
++	cs->power_allocated.attr.attr.mode = 0444;
++	cs->power_allocated.attr.show = power_allocated_show;
++	cs->power_allocated.pse = pse;
++
++	sysfs_attr_init(&cs->power_available.attr.attr);
++	cs->power_available.attr.attr.name = "power_available";
++	cs->power_available.attr.attr.mode = 0444;
++	cs->power_available.attr.show = power_available_show;
++	cs->power_available.pse = pse;
++
++	cs->attrs[0] = &cs->power_allocated.attr.attr;
++	cs->attrs[1] = &cs->power_available.attr.attr;
++	cs->attrs[2] = NULL;
++	cs->group.attrs = cs->attrs;
++
++	return devm_device_add_group(pse->dev, &cs->group);
++}
++
+ static int rtpse_mcu_sysfs_init(struct rtpse_mcu_ctrl *pse)
+ {
+ 	unsigned int n = pse->pcdev.nr_lines, i;
+@@ -1110,7 +1225,11 @@ int rtpse_mcu_register(struct rtpse_mcu_
+ 	if (ret)
+ 		return ret;
+ 
+-	return rtpse_mcu_sysfs_init(pse);
++	ret = rtpse_mcu_sysfs_init(pse);
++	if (ret)
++		return ret;
++
++	return rtpse_mcu_power_sysfs_init(pse);
+ }
+ EXPORT_SYMBOL_GPL(rtpse_mcu_register);
+ 
+@@ -1186,6 +1305,7 @@ static const struct rtpse_mcu_dialect rt
+ 		[RTPSE_MCU_CMD_SET_GLOBAL_STATE]	= RTPSE_MCU_OP(0x00),
+ 		[RTPSE_MCU_CMD_GET_SYSTEM_INFO]		= RTPSE_MCU_OP(0x40),
+ 		[RTPSE_MCU_CMD_GET_EXT_CONFIG]		= RTPSE_MCU_OP(0x4a),
++		[RTPSE_MCU_CMD_GET_POWER_STATS]		= RTPSE_MCU_OP(0x41),
+ 		[RTPSE_MCU_CMD_SET_POWER_MANAGEMENT_MODE] = RTPSE_MCU_OP(0x10),
+ 
+ 		[RTPSE_MCU_CMD_PORT_ENABLE]		= RTPSE_MCU_OP(0x01),
+@@ -1210,6 +1330,7 @@ static const struct rtpse_mcu_dialect rt
+ 	.opcode = {
+ 		[RTPSE_MCU_CMD_GET_SYSTEM_INFO]		= RTPSE_MCU_OP(0x20),
+ 		[RTPSE_MCU_CMD_GET_EXT_CONFIG]		= RTPSE_MCU_OP(0x2b),
++		[RTPSE_MCU_CMD_GET_POWER_STATS]		= RTPSE_MCU_OP(0x23),
+ 		[RTPSE_MCU_CMD_SET_POWER_MANAGEMENT_MODE] = RTPSE_MCU_OP(0x17),
+ 
+ 		[RTPSE_MCU_CMD_PORT_ENABLE]		= RTPSE_MCU_OP(0x00),
