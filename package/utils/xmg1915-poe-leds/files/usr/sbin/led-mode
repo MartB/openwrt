@@ -10,10 +10,9 @@
 # The scan chain only knows link/speed/activity, so PoE display means claiming
 # the port LEDs and writing them, as ZyNOS does. This script only flips the
 # mode; painting is left to poe-led, which already holds the per-port state.
-# Switching back to speed needs no PSE query - releasing the LEDs hands them to
-# the scan engine, which resumes on its own.
+# Switching back to speed needs no PSE query - the rtl930x-hw trigger hands the
+# LEDs to the scan engine, which resumes on its own.
 
-POKE=/sys/kernel/debug/rtl838x/sw_led
 STATE=/var/run/led-mode
 PIDFILE=/var/run/poe-led.pid
 LEDCACHE=/var/run/poe-led.leds
@@ -65,14 +64,26 @@ indicators_off() {
 		set_led "$LED_PWR_RED" 0
 	fi
 }
-# front panel port -> LED scan slot; the two lists are positional pairs
 PORTS="${POE_LED_PORTS:-lan1 lan2 lan3 lan4 lan5 lan6 lan7 lan8}"
-SLOTS="${POE_LED_SLOTS:-0    1    2    3    8    9    10   11}"
+HW_TRIGGER=rtl930x-hw
 
-need_poke() {
-	[ -w "$POKE" ] && return 0
-	echo "led-mode: $POKE missing." >&2
-	echo "led-mode: needs the rtl930x software-LED patch, and debugfs mounted." >&2
+# LED of one colour on a front-panel port: port_led lan3 green
+port_led() { echo "/sys/class/leds/$2:lan-${1#lan}"; }
+
+# Claim (none) or release ($HW_TRIGGER) every port LED.
+port_leds_trigger() {
+	local p c
+
+	for p in $PORTS; do
+		for c in blue green red; do
+			echo "$1" > "$(port_led "$p" "$c")/trigger" || return 1
+		done
+	done
+}
+
+need_leds() {
+	[ -e "$(port_led "${PORTS%% *}" blue)/trigger" ] && return 0
+	echo "led-mode: no port LEDs - does the device tree describe them?" >&2
 	return 1
 }
 
@@ -90,18 +101,18 @@ nudge() {
 	kill -USR1 "$pid" 2>/dev/null
 }
 
-# Repaint from what poe-led published: 24 debugfs writes and no MCU traffic,
+# Repaint from what poe-led published: 24 sysfs writes and no MCU traffic,
 # instead of ~1.2s of ethtool. Falls back to the MCU if no daemon has run.
 paint_from_cache() {
-	local slot b g r n=0
+	local port b g r n=0
 
 	[ -s "$LEDCACHE" ] || return 1
 
-	while read -r slot b g r; do
-		[ -n "$slot" ] || continue
-		echo "$slot 0 $b" > "$POKE" || return 1
-		echo "$slot 1 $g" > "$POKE" || return 1
-		echo "$slot 2 $r" > "$POKE" || return 1
+	while read -r port b g r; do
+		[ -n "$port" ] || continue
+		set_led "$(port_led "$port" blue)" "$b" || return 1
+		set_led "$(port_led "$port" green)" "$g" || return 1
+		set_led "$(port_led "$port" red)" "$r" || return 1
 		n=$((n + 1))
 	done < "$LEDCACHE"
 
@@ -111,7 +122,7 @@ paint_from_cache() {
 # One ethtool call per port. The number is anchored after the keyword, or
 # "Clause 33 PSE Power Class: 4" yields 33.
 paint_poe() {
-	local slot port out class blue green red
+	local port out class blue green red
 
 	# Without ethtool every port reads as "no PD" and the panel goes dark,
 	# which looks like a broken toggle rather than a missing tool.
@@ -120,9 +131,7 @@ paint_poe() {
 		return 1
 	}
 
-	set -- $SLOTS
 	for port in $PORTS; do
-		slot=$1; shift
 		blue=0; green=0; red=0
 
 		if [ -d "/sys/class/net/$port" ] &&
@@ -132,15 +141,15 @@ paint_poe() {
 			class=$(printf '%s\n' "$out" |
 				sed -n 's/.*[Cc]lass[^0-9]*\([0-9][0-9]*\).*/\1/p' | head -1)
 			case "${class:-0}" in
-			0|1|2|3) green=7; red=7 ;;   # 802.3af -> yellow
-			4)       green=7 ;;          # 802.3at -> green
-			*)       blue=7 ;;           # 802.3bt -> blue
+			0|1|2|3) green=1; red=1 ;;   # 802.3af -> yellow
+			4)       green=1 ;;          # 802.3at -> green
+			*)       blue=1 ;;           # 802.3bt -> blue
 			esac
 		fi
 
-		echo "$slot 0 $blue"  > "$POKE" || return 1
-		echo "$slot 1 $green" > "$POKE" || return 1
-		echo "$slot 2 $red"   > "$POKE" || return 1
+		set_led "$(port_led "$port" blue)" "$blue" || return 1
+		set_led "$(port_led "$port" green)" "$green" || return 1
+		set_led "$(port_led "$port" red)" "$red" || return 1
 	done
 }
 
@@ -154,6 +163,8 @@ mode_poe() {
 	set_led "$LED_GREEN" 0
 	set_led "$LED_RED" 0
 
+	port_leds_trigger none || return 1
+
 	# Only nudge the daemon when we fell back to the MCU ourselves, so what
 	# it publishes gets refreshed.
 	if paint_from_cache; then
@@ -165,18 +176,18 @@ mode_poe() {
 	return 0
 }
 
-# Dark mode claims every port LED and forces it off; releasing would hand it
-# back to the scan engine, which lights it from link state.
+# Dark mode turns every port LED off. Writing 0 also drops the hardware
+# trigger, so the scan engine can not light it from link state.
 mode_off() {
-	local slot i
+	local p c
 
 	echo off > "$STATE"
 	persist off
 	indicators_off
 
-	for slot in $SLOTS; do
-		for i in 0 1 2; do
-			echo "$slot $i 0" > "$POKE" || return 1
+	for p in $PORTS; do
+		for c in blue green red; do
+			set_led "$(port_led "$p" "$c")" 0 || return 1
 		done
 	done
 
@@ -185,29 +196,23 @@ mode_off() {
 }
 
 mode_speed() {
-	local slot i
-
 	echo speed > "$STATE"
 	persist speed
 	set_led "$LED_BLUE" 0
 	# Leaving dark mode: the unit is powered, so the PWR LED belongs on
 	# whatever keep_power says - that option only governs dark mode.
 	power_led 1
-	for slot in $SLOTS; do
-		for i in 0 1 2; do
-			echo "$slot $i off" > "$POKE" || return 1
-		done
-	done
+	port_leds_trigger "$HW_TRIGGER" || return 1
 	nudge          # let a running daemon drop the port LEDs from its next pass
 	return 0
 }
 
 case "${1:-status}" in
-poe)    need_poke && mode_poe ;;
-speed)  need_poke && mode_speed ;;
-off)    need_poke && mode_off ;;
+poe)    need_leds && mode_poe ;;
+speed)  need_leds && mode_speed ;;
+off)    need_leds && mode_off ;;
 toggle)
-	need_poke || exit 1
+	need_leds || exit 1
 	# speed -> poe -> off -> speed
 	case "$(cat "$STATE" 2>/dev/null)" in
 	speed|"") mode_poe ;;
