@@ -8,6 +8,47 @@
 #include <dt-bindings/gpio/gpio.h>
 #include <dt-bindings/leds/common.h>
 
+/* Blue, green and red of a copper port, left to the scan engine by default */
+#define PORT_LEDS(n, slot, unit)				\
+	led@unit,0 {						\
+		reg = <slot 0>;					\
+		color = <LED_COLOR_ID_BLUE>;			\
+		function = LED_FUNCTION_LAN;			\
+		function-enumerator = <n>;			\
+		linux,default-trigger = "rtl930x-hw";		\
+	};							\
+	led@unit,1 {						\
+		reg = <slot 1>;					\
+		color = <LED_COLOR_ID_GREEN>;			\
+		function = LED_FUNCTION_LAN;			\
+		function-enumerator = <n>;			\
+		linux,default-trigger = "rtl930x-hw";		\
+	};							\
+	led@unit,2 {						\
+		reg = <slot 2>;					\
+		color = <LED_COLOR_ID_RED>;			\
+		function = LED_FUNCTION_LAN;			\
+		function-enumerator = <n>;			\
+		linux,default-trigger = "rtl930x-hw";		\
+	};
+
+/* Blue for 10G and green for 1G of an SFP+ cage, both lit for 2.5G */
+#define SFP_LEDS(n, slot, unit)					\
+	led@unit,0 {						\
+		reg = <slot 0>;					\
+		color = <LED_COLOR_ID_BLUE>;			\
+		function = LED_FUNCTION_LAN;			\
+		function-enumerator = <n>;			\
+		linux,default-trigger = "rtl930x-hw";		\
+	};							\
+	led@unit,1 {						\
+		reg = <slot 1>;					\
+		color = <LED_COLOR_ID_GREEN>;			\
+		function = LED_FUNCTION_LAN;			\
+		function-enumerator = <n>;			\
+		linux,default-trigger = "rtl930x-hw";		\
+	};
+
 / {
 	compatible = "zyxel,xmg1915-10ep", "realtek,rtl9302c-soc";
 	model = "Zyxel XMG1915-10EP Switch";
@@ -53,6 +94,17 @@
 			color = <LED_COLOR_ID_RED>;
 			function = "poe";
 		};
+
+		PORT_LEDS(1, 0, 0)
+		PORT_LEDS(2, 1, 1)
+		PORT_LEDS(3, 2, 2)
+		PORT_LEDS(4, 3, 3)
+		PORT_LEDS(5, 8, 8)
+		PORT_LEDS(6, 9, 9)
+		PORT_LEDS(7, 10, a)
+		PORT_LEDS(8, 11, b)
+		SFP_LEDS(9, 25, 19)
+		SFP_LEDS(10, 27, 1b)
 	};
 };
 
