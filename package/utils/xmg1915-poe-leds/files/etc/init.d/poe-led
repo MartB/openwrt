@@ -7,7 +7,7 @@ USE_PROCD=1
 
 start_service() {
 	[ -e "/sys/class/leds/green:poe/brightness" ] || {
-		echo "poe-led: no rtl9300 PoE LED - is the software-LED patch applied?" >&2
+		echo "poe-led: no green:poe LED - does the device tree describe it?" >&2
 		return 1
 	}
 

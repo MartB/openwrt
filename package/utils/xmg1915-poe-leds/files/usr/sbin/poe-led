@@ -12,7 +12,6 @@
 # panel is in PoE display mode; BLANK_UNLESS_POE_MODE=1 follows the vendor.
 
 PORTS="${POE_LED_PORTS:-lan1 lan2 lan3 lan4 lan5 lan6 lan7 lan8}"
-SLOTS="${POE_LED_SLOTS:-0 1 2 3 8 9 10 11}"
 LED_GREEN="${POE_LED_GREEN:-/sys/class/leds/green:poe}"
 LED_RED="${POE_LED_RED:-/sys/class/leds/red:poe}"
 
@@ -45,14 +44,13 @@ ALERT_WHEN_OFF="${POE_LED_ALERT_WHEN_OFF:-$(uci -q get poe-led.main.alert_when_o
 INDICATOR="${POE_LED_INDICATOR:-$(uci -q get poe-led.main.indicator || echo gauge)}"
 BLANK_UNLESS_POE_MODE="${BLANK_UNLESS_POE_MODE:-0}"
 
-POKE=/sys/kernel/debug/rtl838x/sw_led
 STATE=/var/run/led-mode
 PIDFILE=/var/run/poe-led.pid
 # Per-port LED values, so led-mode can repaint without the MCU.
 LEDCACHE=/var/run/poe-led.leds
 
 set_led()  { [ -e "$1/brightness" ] && echo "$2" > "$1/brightness" 2>/dev/null; }
-poke_led() { [ -w "$POKE" ] && echo "$1 $2 $3" > "$POKE" 2>/dev/null; }
+port_led() { echo "/sys/class/leds/$2:lan-${1#lan}"; }
 
 # Cheap: sysfs only, and `read <` is a shell builtin, so no fork per port.
 carrier_signature() {
@@ -70,13 +68,11 @@ carrier_signature() {
 # timer, never on the tick. Numbers are anchored after their keyword, or
 # "Clause 33 PSE Power Class: 4" yields 33.
 evaluate() {
-	local p out slot class power used=0 fault=0 mode blue green red cache=""
+	local p out class power used=0 fault=0 mode blue green red cache=""
 
 	mode=$(cat "$STATE" 2>/dev/null)
 
-	set -- $SLOTS
 	for p in $PORTS; do
-		slot=$1; shift
 		blue=0; green=0; red=0
 
 		if [ -d "/sys/class/net/$p" ] &&
@@ -92,9 +88,9 @@ evaluate() {
 				class=$(printf '%s\n' "$out" |
 					sed -n 's/.*[Cc]lass[^0-9]*\([0-9][0-9]*\).*/\1/p' | head -1)
 				case "${class:-0}" in
-				0|1|2|3) green=7; red=7 ;;   # 802.3af -> yellow
-				4)       green=7 ;;          # 802.3at -> green
-				*)       blue=7 ;;           # 802.3bt -> blue
+				0|1|2|3) green=1; red=1 ;;   # 802.3af -> yellow
+				4)       green=1 ;;          # 802.3at -> green
+				*)       blue=1 ;;           # 802.3bt -> blue
 				esac
 				;;
 			esac
@@ -102,12 +98,12 @@ evaluate() {
 
 		# In speed mode the port LEDs belong to the scan engine.
 		[ "$mode" = poe ] && {
-			poke_led "$slot" 0 "$blue"
-			poke_led "$slot" 1 "$green"
-			poke_led "$slot" 2 "$red"
+			set_led "$(port_led "$p" blue)" "$blue"
+			set_led "$(port_led "$p" green)" "$green"
+			set_led "$(port_led "$p" red)" "$red"
 		}
 
-		cache="$cache$slot $blue $green $red
+		cache="$cache$p $blue $green $red
 "
 	done
 
