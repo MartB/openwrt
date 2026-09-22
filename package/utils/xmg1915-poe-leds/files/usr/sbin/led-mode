@@ -5,6 +5,7 @@
 #   led-mode poe      port LEDs show PoE class   (painted by poe-led)
 #   led-mode off      every front-panel LED dark
 #   led-mode toggle   cycles speed -> poe -> off
+#   led-mode release  hand everything back to the switch, keep the saved mode
 #   led-mode status
 #
 # The scan chain only knows link/speed/activity, so PoE display means claiming
@@ -14,6 +15,7 @@
 # LEDs to the scan engine, which resumes on its own.
 
 STATE=/var/run/led-mode
+LOCK=/var/lock/led-mode
 PIDFILE=/var/run/poe-led.pid
 LEDCACHE=/var/run/poe-led.leds
 
@@ -70,7 +72,7 @@ HW_TRIGGER=rtl930x-hw
 # LED of one colour on a front-panel port: port_led lan3 green
 port_led() { echo "/sys/class/leds/$2:lan-${1#lan}"; }
 
-# Claim (none) or release ($HW_TRIGGER) every port LED.
+# Claim (none) or release ($HW_TRIGGER) the LEDs of the ports PoE mode paints.
 port_leds_trigger() {
 	local p c
 
@@ -78,6 +80,27 @@ port_leds_trigger() {
 		for c in blue green red; do
 			echo "$1" > "$(port_led "$p" "$c")/trigger" || return 1
 		done
+	done
+}
+
+# LEDs of the ports PoE mode leaves alone, like the SFP+ cages.
+other_port_leds() {
+	local d
+
+	for d in /sys/class/leds/*:lan-*; do
+		case " $PORTS " in
+		*" lan${d##*-} "*) ;;
+		*) [ -e "$d/trigger" ] && echo "$d" ;;
+		esac
+	done
+}
+
+# Every port LED, copper and SFP+.
+all_port_leds_trigger() {
+	local d
+
+	for d in /sys/class/leds/*:lan-*; do
+		echo "$1" > "$d/trigger" || return 1
 	done
 }
 
@@ -154,6 +177,8 @@ paint_poe() {
 }
 
 mode_poe() {
+	local d
+
 	echo poe > "$STATE"
 	persist poe
 
@@ -164,6 +189,9 @@ mode_poe() {
 	set_led "$LED_RED" 0
 
 	port_leds_trigger none || return 1
+	for d in $(other_port_leds); do
+		echo "$HW_TRIGGER" > "$d/trigger"
+	done
 
 	# Only nudge the daemon when we fell back to the MCU ourselves, so what
 	# it publishes gets refreshed.
@@ -179,16 +207,14 @@ mode_poe() {
 # Dark mode turns every port LED off. Writing 0 also drops the hardware
 # trigger, so the scan engine can not light it from link state.
 mode_off() {
-	local p c
+	local d
 
 	echo off > "$STATE"
 	persist off
 	indicators_off
 
-	for p in $PORTS; do
-		for c in blue green red; do
-			set_led "$(port_led "$p" "$c")" 0 || return 1
-		done
+	for d in /sys/class/leds/*:lan-*; do
+		set_led "$d" 0 || return 1
 	done
 
 	nudge          # so the daemon stops repainting
@@ -202,27 +228,50 @@ mode_speed() {
 	# Leaving dark mode: the unit is powered, so the PWR LED belongs on
 	# whatever keep_power says - that option only governs dark mode.
 	power_led 1
-	port_leds_trigger "$HW_TRIGGER" || return 1
+	all_port_leds_trigger "$HW_TRIGGER" || return 1
 	nudge          # let a running daemon drop the port LEDs from its next pass
 	return 0
 }
 
+# Service stop, including every reboot: speed mode without saving it, so the
+# next start restores the mode that was chosen.
+release() {
+	echo speed > "$STATE"
+	set_led "$LED_BLUE" 0
+	power_led 1
+	all_port_leds_trigger "$HW_TRIGGER"
+}
+
 case "${1:-status}" in
-poe)    need_leds && mode_poe ;;
-speed)  need_leds && mode_speed ;;
-off)    need_leds && mode_off ;;
-toggle)
+status)
+	cat "$STATE" 2>/dev/null || echo speed
+	exit 0
+	;;
+poe|speed|off|toggle|release)
 	need_leds || exit 1
+	;;
+*)
+	echo "usage: ${0##*/} {speed|poe|off|toggle|release|status}" >&2
+	exit 1
+	;;
+esac
+
+# One change at a time, and none while poe-led paints: button presses can
+# arrive faster than a change completes.
+lock "$LOCK"
+trap 'lock -u "$LOCK"' EXIT
+
+case "$1" in
+poe)    mode_poe ;;
+speed)  mode_speed ;;
+off)    mode_off ;;
+release) release ;;
+toggle)
 	# speed -> poe -> off -> speed
 	case "$(cat "$STATE" 2>/dev/null)" in
 	speed|"") mode_poe ;;
 	poe)      mode_off ;;
 	*)        mode_speed ;;
 	esac
-	;;
-status) cat "$STATE" 2>/dev/null || echo speed ;;
-*)
-	echo "usage: ${0##*/} {speed|poe|off|toggle|status}" >&2
-	exit 1
 	;;
 esac
