@@ -76,6 +76,34 @@ static void rtldsa_930x_sw_led_release(void *led)
 	rtldsa_930x_sw_led_own(led, false);
 }
 
+/*
+ * While this trigger is active the scan engine drives the LED again. Taking it
+ * away hands the LED back to software, and the LED core then turns it off.
+ */
+static int rtldsa_930x_sw_led_hw_activate(struct led_classdev *cdev)
+{
+	struct rtldsa_930x_sw_led *led = container_of(cdev, struct rtldsa_930x_sw_led, cdev);
+
+	rtldsa_930x_sw_led_mode_set(led, RTL930X_LED_SW_MODE_OFF);
+	rtldsa_930x_sw_led_own(led, false);
+
+	return 0;
+}
+
+static void rtldsa_930x_sw_led_hw_deactivate(struct led_classdev *cdev)
+{
+	rtldsa_930x_sw_led_own(container_of(cdev, struct rtldsa_930x_sw_led, cdev), true);
+}
+
+static struct led_hw_trigger_type rtldsa_930x_sw_led_hw_type;
+
+static struct led_trigger rtldsa_930x_sw_led_hw_trigger = {
+	.name = "rtl930x-hw",
+	.activate = rtldsa_930x_sw_led_hw_activate,
+	.deactivate = rtldsa_930x_sw_led_hw_deactivate,
+	.trigger_type = &rtldsa_930x_sw_led_hw_type,
+};
+
 static int rtldsa_930x_sw_led_add(struct rtl838x_switch_priv *priv,
 				  struct device_node *np)
 {
@@ -102,6 +130,7 @@ static int rtldsa_930x_sw_led_add(struct rtl838x_switch_priv *priv,
 	led->cdev.max_brightness = LED_ON;
 	led->cdev.brightness_set_blocking = rtldsa_930x_sw_led_brightness_set;
 	led->cdev.brightness_get = rtldsa_930x_sw_led_brightness_get;
+	led->cdev.trigger_type = &rtldsa_930x_sw_led_hw_type;
 
 	switch (led_init_default_state_get(of_fwnode_handle(np))) {
 	case LEDS_DEFSTATE_ON:
@@ -144,6 +173,10 @@ void rtldsa_930x_sw_leds_init(struct rtl838x_switch_priv *priv,
 	leds = of_get_child_by_name(node, "software-leds");
 	if (!leds)
 		return;
+
+	err = devm_led_trigger_register(priv->dev, &rtldsa_930x_sw_led_hw_trigger);
+	if (err)
+		dev_warn(priv->dev, "failed to register LED trigger: %d\n", err);
 
 	for_each_available_child_of_node_scoped(leds, np) {
 		err = rtldsa_930x_sw_led_add(priv, np);
