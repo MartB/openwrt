@@ -3,6 +3,7 @@
 #include <asm/mach-rtl-otto/mach-rtl-otto.h>
 #include <linux/etherdevice.h>
 #include <linux/inetdevice.h>
+#include <linux/leds.h>
 
 #include "lag.h"
 #include "l2.h"
@@ -550,6 +551,115 @@ static void rtl930x_set_egr_filter(int port,  enum egr_filter state)
 		    RTL930X_VLAN_PORT_EGR_FLTR + (((port / 29) << 2)));
 }
 
+struct rtldsa_930x_sw_led {
+	struct led_classdev cdev;
+	struct rtl838x_switch_priv *priv;
+	u8 port;
+	u8 index;
+};
+
+static void rtldsa_930x_sw_led_mode_set(struct rtldsa_930x_sw_led *led, u32 mode)
+{
+	/* Which half the scan engine reads depends on the port type masks */
+	u32 clear = RTL930X_LED_SW_MODE_MASK(led->index, false) |
+		    RTL930X_LED_SW_MODE_MASK(led->index, true);
+	u32 set = mode << RTL930X_LED_SW_MODE_SHIFT(led->index, false) |
+		  mode << RTL930X_LED_SW_MODE_SHIFT(led->index, true);
+
+	mutex_lock(&led->priv->reg_mutex);
+	sw_w32_mask(clear, set, RTL930X_LED_SW_P_CTRL(led->port));
+	sw_w32(RTL930X_LED_SW_CTRL_START, RTL930X_LED_SW_CTRL);
+	mutex_unlock(&led->priv->reg_mutex);
+}
+
+static int rtldsa_930x_sw_led_brightness_set(struct led_classdev *cdev,
+					     enum led_brightness brightness)
+{
+	struct rtldsa_930x_sw_led *led = container_of(cdev, struct rtldsa_930x_sw_led, cdev);
+
+	rtldsa_930x_sw_led_mode_set(led, brightness ? RTL930X_LED_SW_MODE_ON :
+						      RTL930X_LED_SW_MODE_OFF);
+
+	return 0;
+}
+
+static enum led_brightness rtldsa_930x_sw_led_brightness_get(struct led_classdev *cdev)
+{
+	struct rtldsa_930x_sw_led *led = container_of(cdev, struct rtldsa_930x_sw_led, cdev);
+	u32 v = sw_r32(RTL930X_LED_SW_P_CTRL(led->port));
+
+	return (v & RTL930X_LED_SW_MODE_MASK(led->index, false)) ? LED_ON : LED_OFF;
+}
+
+static int rtldsa_930x_sw_led_add(struct rtl838x_switch_priv *priv,
+				  struct device_node *np)
+{
+	struct led_init_data init_data = {};
+	struct rtldsa_930x_sw_led *led;
+	u32 reg[2];
+	int err;
+
+	err = of_property_read_u32_array(np, "reg", reg, ARRAY_SIZE(reg));
+	if (err)
+		return err;
+
+	/* Past the CPU port the per-port control array runs into other registers */
+	if (reg[0] >= priv->r->cpu_port || reg[1] > 3)
+		return -EINVAL;
+
+	led = devm_kzalloc(priv->dev, sizeof(*led), GFP_KERNEL);
+	if (!led)
+		return -ENOMEM;
+
+	led->priv = priv;
+	led->port = reg[0];
+	led->index = reg[1];
+	led->cdev.max_brightness = LED_ON;
+	led->cdev.brightness_set_blocking = rtldsa_930x_sw_led_brightness_set;
+	led->cdev.brightness_get = rtldsa_930x_sw_led_brightness_get;
+
+	switch (led_init_default_state_get(of_fwnode_handle(np))) {
+	case LEDS_DEFSTATE_ON:
+		led->cdev.brightness = LED_ON;
+		break;
+	case LEDS_DEFSTATE_KEEP:
+		led->cdev.brightness = rtldsa_930x_sw_led_brightness_get(&led->cdev);
+		break;
+	default:
+		led->cdev.brightness = LED_OFF;
+		break;
+	}
+
+	mutex_lock(&priv->reg_mutex);
+	sw_w32_mask(0, BIT(led->index) << RTL930X_LED_SW_P_EN_SHIFT(led->port),
+		    RTL930X_LED_SW_P_EN_CTRL(led->port));
+	mutex_unlock(&priv->reg_mutex);
+	rtldsa_930x_sw_led_brightness_set(&led->cdev, led->cdev.brightness);
+
+	init_data.fwnode = of_fwnode_handle(np);
+
+	return devm_led_classdev_register_ext(priv->dev, &led->cdev, &init_data);
+}
+
+static void rtldsa_930x_sw_leds_init(struct rtl838x_switch_priv *priv,
+				     struct device_node *node)
+{
+	struct device_node *leds;
+	int err;
+
+	leds = of_get_child_by_name(node, "software-leds");
+	if (!leds)
+		return;
+
+	for_each_available_child_of_node_scoped(leds, np) {
+		err = rtldsa_930x_sw_led_add(priv, np);
+		if (err)
+			dev_err(priv->dev, "failed to add LED %pOF: %d\n", np, err);
+	}
+
+	of_node_put(leds);
+}
+
 static void rtldsa_930x_led_get_forced(const struct device_node *node,
 				       const u8 leds_in_set[4],
 				       u8 forced_leds_per_port[RTL930X_CPU_PORT])
@@ -696,6 +806,8 @@ static void rtl930x_led_init(struct rtl838x_switch_priv *priv)
 
 	for (int i = 0; i < 24; i++)
 		dev_dbg(dev, "%08x: %08x\n", 0xbb00cc00 + i * 4, sw_r32(0xcc00 + i * 4));
+
+	rtldsa_930x_sw_leds_init(priv, node);
 }
 
 const struct rtldsa_config rtldsa_930x_cfg = {

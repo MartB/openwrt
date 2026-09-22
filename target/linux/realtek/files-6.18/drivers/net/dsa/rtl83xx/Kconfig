@@ -2,6 +2,7 @@
 config NET_DSA_RTL83XX
 	tristate "Realtek RTL838x/RTL839x switch support"
 	depends on MACH_REALTEK_RTL
+	depends on LEDS_CLASS
 	select NET_DSA_TAG_RTL_OTTO
 	select REALTEK_OTTO_TABLE
 	help

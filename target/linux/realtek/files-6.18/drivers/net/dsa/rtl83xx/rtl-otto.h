@@ -760,6 +760,18 @@ enum rtldsa_flood_type {
 #define RTL930X_LED_PORT_COPR_MASK_CTRL		(0xCC3C)
 #define RTL930X_LED_PORT_FIB_MASK_CTRL		(0xCC40)
 #define RTL930X_LED_PORT_COMBO_MASK_CTRL	(0xCC44)
+#define RTL930X_LED_SW_CTRL			(0xCC48)
+#define RTL930X_LED_SW_CTRL_START		BIT(0)
+/* 4 bits per port, set bits hand the LED from the scan engine to software */
+#define RTL930X_LED_SW_P_EN_CTRL(p)		(0xCC4C + (((p) >> 3) << 2))
+#define RTL930X_LED_SW_P_EN_SHIFT(p)		(((p) & 0x7) << 2)
+/* 3 bits per LED, copper in 11:0 and fibre in 23:12 */
+#define RTL930X_LED_SW_P_CTRL(p)		(0xCC5C + ((p) << 2))
+#define RTL930X_LED_SW_MODE_SHIFT(l, fib)	(((fib) ? 12 : 0) + (l) * 3)
+#define RTL930X_LED_SW_MODE_MASK(l, fib)	(0x7 << RTL930X_LED_SW_MODE_SHIFT(l, fib))
+#define RTL930X_LED_SW_MODE_OFF			0
+/* 1-6 blink, at rates doubling from 32 ms to 1024 ms */
+#define RTL930X_LED_SW_MODE_ON			7
 
 #define RTL931X_LED_PORT_NUM_CTRL(p)		(0x0604 + (((p >> 4) << 2)))
 #define RTL931X_LED_SET0_0_CTRL			(0x0630)
