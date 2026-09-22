@@ -45,6 +45,7 @@ INDICATOR="${POE_LED_INDICATOR:-$(uci -q get poe-led.main.indicator || echo gaug
 BLANK_UNLESS_POE_MODE="${BLANK_UNLESS_POE_MODE:-0}"
 
 STATE=/var/run/led-mode
+LOCK=/var/lock/led-mode
 PIDFILE=/var/run/poe-led.pid
 # Per-port LED values, so led-mode can repaint without the MCU.
 LEDCACHE=/var/run/poe-led.leds
@@ -64,75 +65,8 @@ carrier_signature() {
 	echo "$sig"
 }
 
-# Expensive: one MCU conversation per port, on a carrier change or the slow
-# timer, never on the tick. Numbers are anchored after their keyword, or
-# "Clause 33 PSE Power Class: 4" yields 33.
-evaluate() {
-	local p out class power used=0 fault=0 mode blue green red cache=""
-
-	mode=$(cat "$STATE" 2>/dev/null)
-
-	for p in $PORTS; do
-		blue=0; green=0; red=0
-
-		if [ -d "/sys/class/net/$p" ] &&
-		   out=$(ethtool --show-pse "$p" 2>/dev/null); then
-
-			power=$(printf '%s\n' "$out" |
-				sed -n 's/.*[Aa]ctual[^0-9]*\([0-9][0-9]*\).*/\1/p' | head -1)
-			[ -n "$power" ] && used=$((used + power))
-
-			case "$(printf '%s\n' "$out" | grep -i 'detection status')" in
-			*[Ff]ault*) fault=1 ;;
-			*[Dd]elivering*)
-				class=$(printf '%s\n' "$out" |
-					sed -n 's/.*[Cc]lass[^0-9]*\([0-9][0-9]*\).*/\1/p' | head -1)
-				case "${class:-0}" in
-				0|1|2|3) green=1; red=1 ;;   # 802.3af -> yellow
-				4)       green=1 ;;          # 802.3at -> green
-				*)       blue=1 ;;           # 802.3bt -> blue
-				esac
-				;;
-			esac
-		fi
-
-		# In speed mode the port LEDs belong to the scan engine.
-		[ "$mode" = poe ] && {
-			set_led "$(port_led "$p" blue)" "$blue"
-			set_led "$(port_led "$p" green)" "$green"
-			set_led "$(port_led "$p" red)" "$red"
-		}
-
-		cache="$cache$p $blue $green $red
-"
-	done
-
-	# Published in either mode, so switching into PoE display is instant.
-	# Written whole then renamed, so a reader never sees half a file.
-	printf '%s' "$cache" > "$LEDCACHE.new" 2>/dev/null &&
-		mv "$LEDCACHE.new" "$LEDCACHE" 2>/dev/null
-
-	# Work out the critical condition first: dark mode blanks the panel but
-	# should not hide a faulted port or an exhausted budget.
-	#
-	# available / (available + used) is (budget - used) / budget, so the total
-	# cancels and never has to be known. Only the fallback, where there is no
-	# measured figure, depends on BUDGET_MW being right.
-	local avail free_pct
-	if avail=$(hw_available_mw); then
-		free_pct=$(( avail * 100 / (avail + used) ))
-	elif [ "${BUDGET_MW:-0}" -gt 0 ] 2>/dev/null; then
-		free_pct=$(( (BUDGET_MW - used) * 100 / BUDGET_MW ))
-	else
-		# Nothing to judge against: report healthy rather than a false alarm.
-		free_pct=100
-	fi
-	[ "$free_pct" -lt 0 ] && free_pct=0
-
-	local critical=0
-	[ "$fault" = 1 ] && critical=1
-	[ "$free_pct" -lt 5 ] && critical=1
-
+# PoE indicator, from what evaluate() worked out. Runs under the lock.
+show_indicator() {
 	if [ "$mode" = off ]; then
 		set_led "$LED_BLUE" 0
 		set_led "$LED_GREEN" 0
@@ -185,6 +119,80 @@ evaluate() {
 	esac
 }
 
+# Expensive: one MCU conversation per port, on a carrier change or the slow
+# timer, never on the tick. Numbers are anchored after their keyword, or
+# "Clause 33 PSE Power Class: 4" yields 33.
+evaluate() {
+	local p out class power used=0 fault=0 mode blue green red cache=""
+
+	for p in $PORTS; do
+		blue=0; green=0; red=0
+
+		if [ -d "/sys/class/net/$p" ] &&
+		   out=$(ethtool --show-pse "$p" 2>/dev/null); then
+
+			power=$(printf '%s\n' "$out" |
+				sed -n 's/.*[Aa]ctual[^0-9]*\([0-9][0-9]*\).*/\1/p' | head -1)
+			[ -n "$power" ] && used=$((used + power))
+
+			case "$(printf '%s\n' "$out" | grep -i 'detection status')" in
+			*[Ff]ault*) fault=1 ;;
+			*[Dd]elivering*)
+				class=$(printf '%s\n' "$out" |
+					sed -n 's/.*[Cc]lass[^0-9]*\([0-9][0-9]*\).*/\1/p' | head -1)
+				case "${class:-0}" in
+				0|1|2|3) green=1; red=1 ;;   # 802.3af -> yellow
+				4)       green=1 ;;          # 802.3at -> green
+				*)       blue=1 ;;           # 802.3bt -> blue
+				esac
+				;;
+			esac
+		fi
+
+		cache="$cache$p $blue $green $red
+"
+	done
+
+	# Published in either mode, so switching into PoE display is instant.
+	# Written whole then renamed, so a reader never sees half a file.
+	printf '%s' "$cache" > "$LEDCACHE.new" 2>/dev/null &&
+		mv "$LEDCACHE.new" "$LEDCACHE" 2>/dev/null
+
+	# Work out the critical condition first: dark mode blanks the panel but
+	# should not hide a faulted port or an exhausted budget.
+	#
+	# available / (available + used) is (budget - used) / budget, so the total
+	# cancels and never has to be known. Only the fallback, where there is no
+	# measured figure, depends on BUDGET_MW being right.
+	local avail free_pct
+	if avail=$(hw_available_mw); then
+		free_pct=$(( avail * 100 / (avail + used) ))
+	elif [ "${BUDGET_MW:-0}" -gt 0 ] 2>/dev/null; then
+		free_pct=$(( (BUDGET_MW - used) * 100 / BUDGET_MW ))
+	else
+		# Nothing to judge against: report healthy rather than a false alarm.
+		free_pct=100
+	fi
+	[ "$free_pct" -lt 0 ] && free_pct=0
+
+	local critical=0
+	[ "$fault" = 1 ] && critical=1
+	[ "$free_pct" -lt 5 ] && critical=1
+
+	# The mode is read and the port LEDs are painted under led-mode's lock,
+	# so a button press during the MCU round trips above is not painted over.
+	# In speed mode the port LEDs belong to the scan engine.
+	lock "$LOCK"; LOCKED=1
+	mode=$(cat "$STATE" 2>/dev/null)
+	[ "$mode" = poe ] && printf '%s' "$cache" | while read -r p blue green red; do
+		set_led "$(port_led "$p" blue)" "$blue"
+		set_led "$(port_led "$p" green)" "$green"
+		set_led "$(port_led "$p" red)" "$red"
+	done
+	show_indicator
+	lock -u "$LOCK"; LOCKED=0
+}
+
 # One-shot check so a label mismatch is loud rather than a gauge stuck at 0.
 selftest() {
 	local p first
@@ -199,6 +207,8 @@ selftest() {
 }
 
 cleanup() {
+	# only our own: lock -u releases whoever holds it
+	[ "$LOCKED" = 1 ] && lock -u "$LOCK"
 	set_led "$LED_GREEN" 0
 	set_led "$LED_RED" 0
 	rm -f "$PIDFILE"

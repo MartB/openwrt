@@ -34,8 +34,8 @@ service_started() {
 }
 
 stop_service() {
-	# hand the port LEDs back to the switch and blank the indicators
-	[ -x /usr/sbin/led-mode ] && /usr/sbin/led-mode speed
+	# hand the LEDs back to the switch; "release" leaves the saved mode alone
+	[ -x /usr/sbin/led-mode ] && /usr/sbin/led-mode release
 }
 
 service_triggers() {
