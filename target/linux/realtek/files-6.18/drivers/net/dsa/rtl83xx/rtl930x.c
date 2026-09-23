@@ -7,6 +7,7 @@
 #include <linux/regmap.h>
 
 #include "lag.h"
+#include "leds.h"
 #include "l2.h"
 #include "l3.h"
 #include "pie.h"
@@ -386,6 +387,8 @@ static void rtl930x_led_init(struct otto_dsa_priv *priv)
 	for (int i = 0; i < 24; i++)
 		dev_dbg(dev, "%08x: %08x\n", 0xbb00cc00 + i * 4,
 			rtl930x_read_debug_reg(priv, 0xcc00 + i * 4));
+
+	rtldsa_930x_sw_leds_init(priv, node);
 }
 
 const struct rtldsa_config rtldsa_930x_cfg = {

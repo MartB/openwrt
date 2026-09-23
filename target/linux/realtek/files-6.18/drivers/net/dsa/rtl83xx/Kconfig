@@ -6,3 +6,8 @@ config NET_DSA_RTL83XX
 	select REALTEK_OTTO_TABLE
 	help
 	  This driver adds support for Realtek RTL83xx series switching.
+
+config NET_DSA_RTL83XX_LEDS
+	def_bool y
+	depends on NET_DSA_RTL83XX
+	depends on LEDS_CLASS=y || LEDS_CLASS=NET_DSA_RTL83XX
