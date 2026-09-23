@@ -1,0 +1,26 @@
+From: Martin Böh <contact@martb.dev>
+Date: Wed, 23 Sep 2026 02:10:00 +0200
+Subject: [PATCH] net: phy: realtek: support EDPD on RTL8224
+
+The RTL8224 controls Advanced Link Down Power Saving with the same bit
+as the RTL8221B, bit 2 of PHYCR1 in MMD VEND2, which is what Realtek's
+own RTL8224 code writes. The driver never touches it, so it stays at
+whatever the PHY came up with.
+
+Use the EDPD tunable handlers of the RTL826x entries for it, so it can
+be changed with "ethtool --set-phy-tunable <dev> energy-detect-power-down".
+
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Martin Böh <contact@martb.dev>
+---
+--- a/drivers/net/phy/realtek/realtek_main.c
++++ b/drivers/net/phy/realtek/realtek_main.c
+@@ -3591,6 +3591,8 @@ static struct phy_driver realtek_drvs[]
+ 		.resume		= rtlgen_c45_resume,
+ 		.cable_test_start = rtl8224_cable_test_start,
+ 		.cable_test_get_status = rtl8224_cable_test_get_status,
++		.get_tunable	= rtl826x_get_tunable,
++		.set_tunable	= rtl826x_set_tunable,
+ 	}, {
+ 		PHY_ID_MATCH_EXACT(0x001cc961),
+ 		.name		= "RTL8366RB Gigabit Ethernet",
