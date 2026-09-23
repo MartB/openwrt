@@ -167,29 +167,20 @@ function fans() {
 	return out;
 }
 
-// Link-down power saving, on the PHY rather than the PSE. DSA user ports get
-// no phydev symlink, so go via the mdio bus: copper lanN sits at PHY address
-// N-1, which is unique across the busses because each quad takes four in turn.
-function phy_path(port) {
-	const m = match(port, /^lan([0-9]+)$/);
-	if (!m)
-		return null;
-
-	for (let d in glob(sprintf('/sys/bus/mdio_bus/devices/*:%02x', +m[1] - 1)) ?? [])
-		return d;
-
-	return null;
-}
-
-// Absent unless the driver exposes it, so null means "no such knob", not "off".
+// ALDPS is the PHY's EDPD tunable. null means the PHY has no such knob, not
+// "off".
 function port_aldps(port) {
-	const d = phy_path(port);
-	if (!d)
+	const fd = popen(`ethtool --get-phy-tunable ${port} energy-detect-power-down 2>/dev/null`, 'r');
+	if (!fd)
 		return null;
 
-	const v = trim(readfile(`${d}/aldps`) ?? '');
+	const out = fd.read('all') ?? '';
+	fd.close();
 
-	return length(v) ? (+v != 0) : null;
+	if (index(out, ': disabled') >= 0)
+		return false;
+
+	return index(out, ': enabled') >= 0 ? true : null;
 }
 
 // Local netlink, not an MCU round trip, so this is cheap next to read_port().
@@ -486,18 +477,12 @@ const methods = {
 			if (!port || !match(port, /^[a-z0-9_-]+$/))
 				return { success: false, error: 'bad port' };
 
-			const d = phy_path(port);
-			if (!d || port_aldps(port) == null)
+			if (port_aldps(port) == null)
 				return { success: false, error: 'not supported' };
 
-			const path = `${d}/aldps`;
-
-			const fd = open(path, 'w');
-			if (!fd)
-				return { success: false, error: 'cannot write' };
-
-			fd.write(enable ? '1\n' : '0\n');
-			fd.close();
+			const rc = system(`ethtool --set-phy-tunable ${port} energy-detect-power-down ${enable ? 'on' : 'off'} 2>/dev/null`);
+			if (rc != 0)
+				return { success: false, error: 'cannot set' };
 
 			const sid = device_section(port);
 			if (sid) {
