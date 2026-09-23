@@ -1,0 +1,60 @@
+From: Martin Böh <contact@martb.dev>
+Date: Wed, 23 Sep 2026 03:00:00 +0200
+Subject: [PATCH ethtool] ethtool: fix the default EDPD TX interval
+
+The man page says that "--set-phy-tunable DEV energy-detect-power-down
+on" without msecs uses the PHY's default TX interval, but the command
+always fails with "'msecs' max value is 65533.". The interval starts out
+as ETHTOOL_PHY_EDPD_DFLT_TX_MSECS (0xffff), and the range check meant for
+a user supplied msecs value rejects it. The default can never be
+requested, so the branches marvell10g, adin, bcm54140 and smsc have for
+it are unreachable, and a PHY driver that supports only the default
+cannot have EDPD enabled at all.
+
+Only range check msecs when it was given. When reading the tunable back,
+print the default as such instead of as "TX 65535 msecs".
+
+Fixes: e5684313dbf1 ("ethtool: implement support for Energy Detect Power Down")
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Martin Böh <contact@martb.dev>
+---
+--- a/ethtool.c
++++ b/ethtool.c
+@@ -5457,6 +5457,9 @@ static int do_get_phy_tunable(struct cmd
+ 		else if (cont.msecs == ETHTOOL_PHY_EDPD_NO_TX)
+ 			fprintf(stdout,
+ 				"Energy Detect Power Down: enabled, TX disabled\n");
++		else if (cont.msecs == ETHTOOL_PHY_EDPD_DFLT_TX_MSECS)
++			fprintf(stdout,
++				"Energy Detect Power Down: enabled, default TX interval\n");
+ 		else
+ 			fprintf(stdout,
+ 				"Energy Detect Power Down: enabled, TX %u msecs\n",
+@@ -5632,7 +5635,7 @@ static int do_set_phy_tunable(struct cmd
+ 	u8 ds_changed = 0, ds_has_cnt = 0, ds_enable = 0;
+ 	u8 fld_changed = 0, fld_enable = 0;
+ 	u8 fld_msecs = ETHTOOL_PHY_FAST_LINK_DOWN_ON;
+-	u8 edpd_changed = 0, edpd_enable = 0;
++	u8 edpd_changed = 0, edpd_enable = 0, edpd_has_msecs = 0;
+ 	u16 edpd_tx_interval = ETHTOOL_PHY_EDPD_DFLT_TX_MSECS;
+ 
+ 	/* Parse arguments */
+@@ -5647,7 +5650,8 @@ static int do_set_phy_tunable(struct cmd
+ 				    &edpd_enable)) {
+ 		edpd_changed = 1;
+ 		if (edpd_enable)
+-			parse_named_u16(ctx, "msecs", &edpd_tx_interval);
++			edpd_has_msecs = parse_named_u16(ctx, "msecs",
++							 &edpd_tx_interval);
+ 	} else {
+ 		exit_bad_args();
+ 	}
+@@ -5675,6 +5679,8 @@ static int do_set_phy_tunable(struct cmd
+ 	} else if (edpd_changed) {
+ 		if (!edpd_enable)
+ 			edpd_tx_interval = ETHTOOL_PHY_EDPD_DISABLE;
++		else if (!edpd_has_msecs)
++			edpd_tx_interval = ETHTOOL_PHY_EDPD_DFLT_TX_MSECS;
+ 		else if (edpd_tx_interval == 0)
+ 			edpd_tx_interval = ETHTOOL_PHY_EDPD_NO_TX;
+ 		else if (edpd_tx_interval > ETHTOOL_PHY_EDPD_NO_TX) {
