@@ -2,7 +2,7 @@
 # Reapply the per-port settings netifd does not know about.
 #
 # It restores pse, pse_power_limit, pse_priority and eee itself. detection_legacy
-# is a PSE sysfs file and aldps a PHY one, so both would revert on every reboot --
+# is a PSE sysfs file and aldps a PHY tunable, so both would revert on every reboot --
 # and a legacy PD is exactly the device that would then stop coming up. Read from
 # the same device section as the rest.
 
@@ -41,24 +41,15 @@ apply_port() {
 }
 
 apply_aldps() {
-	local sid="$1" name aldps addr d
+	local sid="$1" name aldps
 
 	config_get name "$sid" name
 	config_get aldps "$sid" phy_aldps
 
 	[ -n "$name" ] && [ -n "$aldps" ] || return 0
 
-	# No phydev symlink on DSA user ports; copper lanN is PHY address N-1.
-	case "$name" in
-	lan[0-9]|lan[0-9][0-9]) addr=$(( ${name#lan} - 1 )) ;;
-	*) return 0 ;;
-	esac
-
-	for d in /sys/bus/mdio_bus/devices/*:$(printf '%02x' $addr); do
-		[ -w "$d/aldps" ] || continue
-		echo "$aldps" > "$d/aldps"
-		return 0
-	done
+	[ "$aldps" = 1 ] && aldps=on || aldps=off
+	ethtool --set-phy-tunable "$name" energy-detect-power-down "$aldps" 2>/dev/null
 }
 
 start() {
