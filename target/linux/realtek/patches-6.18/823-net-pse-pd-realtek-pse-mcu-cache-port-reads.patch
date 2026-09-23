@@ -1,0 +1,248 @@
+From: Martin Böh <contact@martb.dev>
+Date: Wed, 23 Sep 2026 02:40:00 +0200
+Subject: [PATCH] net: pse-pd: realtek-pse-mcu: cache port reads
+
+One "ethtool --show-pse" calls several PSE ops, and each of them is its
+own request/response over the MCU link, several for the same read. At
+115200 baud, showing all ports of a switch takes over a second.
+
+Keep each port's replies for 100 ms and serve repeats from them. PD
+events are far slower than that, and every write drops the port's copy,
+or all of them for a global one, so a read after a write is never stale.
+A query goes from seven transactions to four.
+
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Martin Böh <contact@martb.dev>
+---
+--- a/drivers/net/pse-pd/realtek-pse-mcu.h
++++ b/drivers/net/pse-pd/realtek-pse-mcu.h
+@@ -75,6 +75,8 @@ struct rtpse_mcu_transport_ops {
+ 		    struct rtpse_mcu_msg *resp);
+ };
+ 
++struct rtpse_mcu_port_cache;
++
+ struct rtpse_mcu_ctrl {
+ 	struct device *dev;
+ 	struct pse_controller_dev pcdev;
+@@ -83,6 +85,8 @@ struct rtpse_mcu_ctrl {
+ 	const struct rtpse_mcu_chip_info *chip;
+ 	const struct rtpse_mcu_transport_ops *transport;
+ 	u8 seq;			/* rolling request seq_num, echoed by the MCU */
++	struct mutex cache_lock;	/* protects cache */
++	struct rtpse_mcu_port_cache *cache;
+ };
+ 
+ int rtpse_mcu_register(struct rtpse_mcu_ctrl *pse);
+--- a/drivers/net/pse-pd/realtek-pse-mcu-core.c
++++ b/drivers/net/pse-pd/realtek-pse-mcu-core.c
+@@ -70,6 +70,9 @@
+ /* Nominal PSE rail; 802.3at/bt operating range. */
+ #define RTPSE_MCU_PSE_VOLTAGE_UV		54000000
+ 
++/* How long a port read is served from the cache */
++#define RTPSE_MCU_CACHE_MS			100
++
+ /* RTPSE_MCU_CMD_SET_POWER_MANAGEMENT_MODE values */
+ #define RTPSE_MCU_DYNAMIC_POWER_MGMT_PRIO	0x02	/* dynamic, with port priority */
+ 
+@@ -137,6 +140,21 @@ struct rtpse_mcu_port_ext_config {
+ 	u8 priority;
+ };
+ 
++enum rtpse_mcu_cache_slot {
++	RTPSE_MCU_CACHE_STATUS,
++	RTPSE_MCU_CACHE_MEASUREMENT,
++	RTPSE_MCU_CACHE_CONFIG,
++	RTPSE_MCU_CACHE_EXT_CONFIG,
++
++	RTPSE_MCU_NUM_CACHE_SLOTS
++};
++
++struct rtpse_mcu_port_cache {
++	struct rtpse_mcu_msg resp[RTPSE_MCU_NUM_CACHE_SLOTS];
++	unsigned long expires[RTPSE_MCU_NUM_CACHE_SLOTS];
++	bool valid[RTPSE_MCU_NUM_CACHE_SLOTS];
++};
++
+ struct rtpse_mcu_dialect {
+ 	struct rtpse_mcu_opcode opcode[RTPSE_MCU_NUM_CMDS];
+ 
+@@ -287,6 +305,17 @@ static int rtpse_mcu_do_xfer(struct rtps
+ 	return 0;
+ }
+ 
++/* Forget the cached reads of one port, or of all ports if @port is negative. */
++static void rtpse_mcu_cache_drop(struct rtpse_mcu_ctrl *pse, int port)
++{
++	guard(mutex)(&pse->cache_lock);
++
++	if (port < 0)
++		memset(pse->cache, 0, pse->pcdev.nr_lines * sizeof(*pse->cache));
++	else
++		memset(&pse->cache[port], 0, sizeof(*pse->cache));
++}
++
+ static int rtpse_mcu_port_query(struct rtpse_mcu_ctrl *pse, unsigned int port, u8 opcode,
+ 				struct rtpse_mcu_msg *resp)
+ {
+@@ -316,6 +345,8 @@ static int rtpse_mcu_port_cmd(struct rtp
+ 	req.payload[1] = arg;
+ 
+ 	ret = rtpse_mcu_do_xfer(pse, &req, &resp);
++	/* Even a failed write may have changed the port */
++	rtpse_mcu_cache_drop(pse, port);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -380,6 +411,7 @@ static int rtpse_mcu_set_global_state(st
+ 	req.payload[0] = enable ? 0x1 : 0x0;
+ 
+ 	ret = rtpse_mcu_do_xfer(pse, &req, &resp);
++	rtpse_mcu_cache_drop(pse, -1);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -400,6 +432,7 @@ static int rtpse_mcu_set_power_managemen
+ 	req.payload[0] = value;
+ 
+ 	ret = rtpse_mcu_do_xfer(pse, &req, &resp);
++	rtpse_mcu_cache_drop(pse, -1);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -408,18 +441,52 @@ static int rtpse_mcu_set_power_managemen
+ 
+ /* Port operations */
+ 
++/*
++ * One ethtool PSE query calls several of these ops back to back, and each
++ * would be its own round trip to the MCU, several of them for the same read.
++ * Serve repeats from a short-lived per-port copy instead. PD events are much
++ * slower than this, and every write drops the copy.
++ */
++static int rtpse_mcu_port_read(struct rtpse_mcu_ctrl *pse, unsigned int port,
++			       enum rtpse_mcu_cache_slot slot,
++			       struct rtpse_mcu_msg *resp)
++{
++	static const enum rtpse_mcu_cmd cmds[RTPSE_MCU_NUM_CACHE_SLOTS] = {
++		[RTPSE_MCU_CACHE_STATUS]	= RTPSE_MCU_CMD_PORT_GET_STATUS,
++		[RTPSE_MCU_CACHE_MEASUREMENT]	= RTPSE_MCU_CMD_PORT_GET_POWER_STATS,
++		[RTPSE_MCU_CACHE_CONFIG]	= RTPSE_MCU_CMD_PORT_GET_CONFIG,
++		[RTPSE_MCU_CACHE_EXT_CONFIG]	= RTPSE_MCU_CMD_PORT_GET_EXT_CONFIG,
++	};
++	const struct rtpse_mcu_opcode *opc = &pse->dialect->opcode[cmds[slot]];
++	struct rtpse_mcu_port_cache *c = &pse->cache[port];
++	int ret;
++
++	if (!opc->valid)
++		return -EOPNOTSUPP;
++
++	guard(mutex)(&pse->cache_lock);
++
++	if (!c->valid[slot] || time_after_eq(jiffies, c->expires[slot])) {
++		ret = rtpse_mcu_port_query(pse, port, opc->op, &c->resp[slot]);
++		c->valid[slot] = !ret;
++		if (ret)
++			return ret;
++
++		c->expires[slot] = jiffies + msecs_to_jiffies(RTPSE_MCU_CACHE_MS);
++	}
++
++	*resp = c->resp[slot];
++
++	return 0;
++}
++
+ static int rtpse_mcu_port_get_status(struct rtpse_mcu_ctrl *pse, unsigned int port,
+ 				     struct rtpse_mcu_port_status *status)
+ {
+-	const struct rtpse_mcu_opcode *opc;
+ 	struct rtpse_mcu_msg resp;
+ 	int ret;
+ 
+-	opc = &pse->dialect->opcode[RTPSE_MCU_CMD_PORT_GET_STATUS];
+-	if (!opc->valid)
+-		return -EOPNOTSUPP;
+-
+-	ret = rtpse_mcu_port_query(pse, port, opc->op, &resp);
++	ret = rtpse_mcu_port_read(pse, port, RTPSE_MCU_CACHE_STATUS, &resp);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -433,15 +500,10 @@ static int rtpse_mcu_port_get_status(str
+ static int rtpse_mcu_port_get_measurement(struct rtpse_mcu_ctrl *pse, unsigned int port,
+ 					  struct rtpse_mcu_port_measurement *measurement)
+ {
+-	const struct rtpse_mcu_opcode *opc;
+ 	struct rtpse_mcu_msg resp;
+ 	int ret;
+ 
+-	opc = &pse->dialect->opcode[RTPSE_MCU_CMD_PORT_GET_POWER_STATS];
+-	if (!opc->valid)
+-		return -EOPNOTSUPP;
+-
+-	ret = rtpse_mcu_port_query(pse, port, opc->op, &resp);
++	ret = rtpse_mcu_port_read(pse, port, RTPSE_MCU_CACHE_MEASUREMENT, &resp);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -456,15 +518,10 @@ static int rtpse_mcu_port_get_measuremen
+ static int rtpse_mcu_port_get_config(struct rtpse_mcu_ctrl *pse, unsigned int port,
+ 				     struct rtpse_mcu_port_config *config)
+ {
+-	const struct rtpse_mcu_opcode *opc;
+ 	struct rtpse_mcu_msg resp;
+ 	int ret;
+ 
+-	opc = &pse->dialect->opcode[RTPSE_MCU_CMD_PORT_GET_CONFIG];
+-	if (!opc->valid)
+-		return -EOPNOTSUPP;
+-
+-	ret = rtpse_mcu_port_query(pse, port, opc->op, &resp);
++	ret = rtpse_mcu_port_read(pse, port, RTPSE_MCU_CACHE_CONFIG, &resp);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -477,15 +534,10 @@ static int rtpse_mcu_port_get_config(str
+ static int rtpse_mcu_port_get_ext_config(struct rtpse_mcu_ctrl *pse, unsigned int port,
+ 					 struct rtpse_mcu_port_ext_config *config)
+ {
+-	const struct rtpse_mcu_opcode *opc;
+ 	struct rtpse_mcu_msg resp;
+ 	int ret;
+ 
+-	opc = &pse->dialect->opcode[RTPSE_MCU_CMD_PORT_GET_EXT_CONFIG];
+-	if (!opc->valid)
+-		return -EOPNOTSUPP;
+-
+-	ret = rtpse_mcu_port_query(pse, port, opc->op, &resp);
++	ret = rtpse_mcu_port_read(pse, port, RTPSE_MCU_CACHE_EXT_CONFIG, &resp);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -996,6 +1048,16 @@ int rtpse_mcu_register(struct rtpse_mcu_
+ 	if (ret)
+ 		return ret;
+ 
++	pse->pcdev.nr_lines = info.max_ports;
++	pse->cache = devm_kcalloc(pse->dev, info.max_ports, sizeof(*pse->cache),
++				  GFP_KERNEL);
++	if (!pse->cache)
++		return -ENOMEM;
++
++	ret = devm_mutex_init(pse->dev, &pse->cache_lock);
++	if (ret)
++		return ret;
++
+ 	/*
+ 	 * Some boards gate all ports through a hardware line; deassert it only
+ 	 * after the MCU is confirmed, so a discover failure never ungates the
+@@ -1041,7 +1103,6 @@ int rtpse_mcu_register(struct rtpse_mcu_
+ 	pse->pcdev.ops      = &rtpse_mcu_ops;
+ 	pse->pcdev.dev      = pse->dev;
+ 	pse->pcdev.types    = ETHTOOL_PSE_C33;
+-	pse->pcdev.nr_lines = info.max_ports;
+ 	pse->pcdev.pis_prio_max = RTPSE_MCU_PORT_MAX_PRIORITY;
+ 	pse->pcdev.supp_budget_eval_strategies = PSE_BUDGET_EVAL_STRAT_DYNAMIC;
+ 
