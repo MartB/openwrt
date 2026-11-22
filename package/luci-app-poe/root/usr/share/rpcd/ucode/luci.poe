@@ -62,6 +62,18 @@ function port_legacy(port) {
 	return v == null ? null : (v != 0);
 }
 
+// True while the port is limited by its PD's class (the MCU's default),
+// false once a limit is set; null where the kernel cannot tell.
+function port_limit_class(port) {
+	const idx = pse_port_index(port);
+	if (idx == null)
+		return null;
+
+	const v = pse_attr(`port${idx}/power_limit_class`);
+
+	return v == null ? null : (v != 0);
+}
+
 function poe_ports() {
 	uci.load('luci');
 
@@ -225,6 +237,7 @@ function read_port(port) {
 		class:    num(/Power Class:\s*([0-9]+)/),
 		power_mw: num(/Actual Power:\s*([0-9]+)/),
 		limit_mw: num(/Available Power Limit:\s*([0-9]+)/),
+		limit_class: port_limit_class(port),
 		priority: num(/\nPriority:\s*([0-9]+)/),
 		prio_max: num(/Max allowed priority:\s*([0-9]+)/),
 		carrier:  trim(readfile(`/sys/class/net/${port}/carrier`) ?? '') == '1',
@@ -372,7 +385,8 @@ const methods = {
 
 	// Power limit in mW. The ranges ethtool reports are what the MCU accepts;
 	// it clamps anything outside them rather than failing, so report back what
-	// the port ends up with.
+	// the port ends up with. 0 clears the limit: the port goes back to the
+	// limit its PD's class allows, which ethtool has no way to ask for.
 	setLimit: {
 		args: { port: 'lan1', limit_mw: 30000 },
 		call: function(req) {
@@ -381,8 +395,31 @@ const methods = {
 
 			if (!port || !match(port, /^[a-z0-9_-]+$/))
 				return { success: false, error: 'bad port' };
-			if (mw <= 0 || mw > 100000)
+			if (mw < 0 || mw > 100000)
 				return { success: false, error: 'limit out of range' };
+
+			if (mw == 0) {
+				const idx = pse_port_index(port);
+				const path = (idx != null) ? pse_attr_path(`port${idx}/power_limit_class`) : null;
+				if (!path)
+					return { success: false, error: 'not supported' };
+
+				const fd = open(path, 'w');
+				if (!fd)
+					return { success: false, error: 'cannot write' };
+
+				const ok = fd.write('1\n') != null;
+				fd.close();
+
+				const sid = device_section(port);
+				if (sid) {
+					uci.delete('network', sid, 'pse_power_limit');
+					uci.commit('network');
+				}
+
+				return { success: ok, port: port, limit_class: port_limit_class(port),
+					 persisted: sid != null };
+			}
 
 			const rc = system(`ethtool --set-pse ${port} c33-pse-avail-pw-limit ${mw} 2>/dev/null`);
 

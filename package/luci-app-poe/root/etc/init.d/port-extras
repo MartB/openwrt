@@ -5,6 +5,10 @@
 # is a PSE sysfs file and aldps a PHY tunable, so both would revert on every reboot --
 # and a legacy PD is exactly the device that would then stop coming up. Read from
 # the same device section as the rest.
+#
+# The reverse holds for power limits: netifd sets the ones configured, but cannot
+# clear one, and the PoE MCU keeps a limit across a warm reboot. Put every port
+# without a pse_power_limit back on the limit its PD's class allows.
 
 START=96
 
@@ -40,6 +44,31 @@ apply_port() {
 	echo "$legacy" > "$ROOT/port$idx/detection_legacy"
 }
 
+LIMITED=" "
+
+note_limit() {
+	local sid="$1" name limit
+
+	config_get name "$sid" name
+	config_get limit "$sid" pse_power_limit
+
+	[ -n "$name" ] && [ -n "$limit" ] && LIMITED="$LIMITED$name "
+}
+
+clear_limits() {
+	local f idx
+
+	for f in "$ROOT"/port*/power_limit_class; do
+		[ -w "$f" ] || continue
+		idx=${f%/power_limit_class}
+		idx=${idx##*/port}
+		case "$LIMITED" in
+		*" lan$((idx + 1)) "*) continue ;;
+		esac
+		[ "$(cat "$f")" = 1 ] || echo 1 > "$f"
+	done
+}
+
 apply_aldps() {
 	local sid="$1" name aldps
 
@@ -58,4 +87,6 @@ start() {
 
 	ROOT=$(pse_root) || return 0
 	config_foreach apply_port device
+	config_foreach note_limit device
+	clear_limits
 }

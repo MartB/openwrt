@@ -208,9 +208,15 @@ return view.extend({
 				E('div', { 'class': 'td' }, E('input', {
 					'type': 'number', 'min': 1, 'max': 100, 'step': 0.1,
 					'style': 'width:5em',
-					'value': p.limit_mw != null ? (p.limit_mw / 1000) : '',
+					// Empty while the port follows its PD's class.
+					'value': (p.limit_class || p.limit_mw == null) ? '' : (p.limit_mw / 1000),
+					'placeholder': p.limit_class ? _('class') : '',
+					'title': p.limit_class != null
+						? _('Leave empty to limit the port by its PD class') : null,
 					'change': ui.createHandlerFn(this, function(ev) {
 						const w = parseFloat(ev.target.value);
+						if (ev.target.value === '' && p.limit_class === false)
+							return callSetLimit(p.port, 0).then(() => self.refresh());
 						if (!(w > 0))
 							return self.refresh();
 						return callSetLimit(p.port, Math.round(w * 1000))
