@@ -133,6 +133,7 @@ void otto_vlan_930x_profile_dump(struct otto_dsa_priv *priv, int idx);
 void otto_vlan_930x_set_untagged(u32 vlan, u64 portmask);
 void otto_vlan_930x_port_forward_on_inner(struct otto_dsa_priv *priv, int port, bool is_set);
 void otto_vlan_930x_profile_setup(struct otto_dsa_priv *priv, int profile);
+void otto_vlan_930x_enable_mcast_flood(struct otto_dsa_priv *priv, int port, bool enable);
 void otto_vlan_930x_port_keep_tag_set(struct otto_dsa_priv *priv, int port, bool keep_outer,
 				      bool keep_inner);
 void otto_vlan_930x_qinq_setup(struct otto_dsa_priv *priv);

@@ -686,8 +686,13 @@ void otto_vlan_930x_profile_setup(struct otto_dsa_priv *priv, int profile)
 	regmap_read(priv->map, RTL930X_VLAN_PROFILE_SET(profile), &p[0]);
 	regmap_read(priv->map, RTL930X_VLAN_PROFILE_SET(profile) + 4, &p[1]);
 
-	/* Enable routing of Ipv4/6 Unicast and IPv4/6 Multicast traffic */
-	p[0] |= BIT(17) | BIT(16) | BIT(13) | BIT(12);
+	/* Enable routing of IPv4/6 unicast traffic. Multicast routing stays off:
+	 * nothing programs a multicast route, and with it on the L3 lookup
+	 * floods unknown IP multicast to the whole VLAN, past the unknown
+	 * multicast flood portmasks (BR_MCAST_FLOOD).
+	 */
+	p[0] |= BIT(17) | BIT(16);
+	p[0] &= ~(BIT(13) | BIT(12));
 
 	p[2] = RTL930X_VLAN_L2_UNKN_MC_FLD(RTL930X_MC_PMASK_ALL_PORTS);
 	p[3] = RTL930X_VLAN_IP4_UNKN_MC_FLD(RTL930X_MC_PMASK_ALL_PORTS);
@@ -698,6 +703,15 @@ void otto_vlan_930x_profile_setup(struct otto_dsa_priv *priv, int profile)
 	regmap_write(priv->map, RTL930X_VLAN_PROFILE_SET(profile) + 8, p[2]);
 	regmap_write(priv->map, RTL930X_VLAN_PROFILE_SET(profile) + 12, p[3]);
 	regmap_write(priv->map, RTL930X_VLAN_PROFILE_SET(profile) + 16, p[4]);
+}
+
+/* BR_MCAST_FLOOD: the port in or out of the flood portmasks for unknown L2,
+ * IPv4 and IPv6 multicast of profile 0, which every VLAN uses.
+ */
+void otto_vlan_930x_enable_mcast_flood(struct otto_dsa_priv *priv, int port, bool enable)
+{
+	for (int i = 2; i <= 4; i++)
+		regmap_assign_bits(priv->map, RTL930X_VLAN_PROFILE_SET(0) + i * 4, BIT(port), enable);
 }
 
 void otto_vlan_930x_qinq_setup(struct otto_dsa_priv *priv)

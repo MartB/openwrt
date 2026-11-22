@@ -491,6 +491,7 @@ const struct rtldsa_config rtldsa_930x_cfg = {
 	.enable_learning = otto_l2_930x_enable_learning,
 	.set_l2_new_sa_trap = otto_l2_930x_set_port_new_sa_trap,
 	.enable_flood = otto_l2_930x_enable_flood,
+	.enable_mcast_flood = otto_vlan_930x_enable_mcast_flood,
 	.enable_bcast_flood = otto_l2_930x_enable_bcast_flood,
 	.set_receive_management_action = rtldsa_930x_set_receive_management_action,
 	.queue_sched_set = otto_qos_930x_queue_sched_set,
