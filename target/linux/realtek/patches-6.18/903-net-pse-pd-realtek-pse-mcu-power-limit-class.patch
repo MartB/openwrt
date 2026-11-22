@@ -1,0 +1,209 @@
+From: OpenWrt local
+Subject: net: pse-pd: realtek-pse-mcu: let a port go back to class-based limiting
+
+Setting a power limit through ethtool switches the port from the MCU's
+default, a limit taken from the PD's class, to a user-defined one, and the
+PSE core has no call that clears a limit again. The MCU keeps the setting
+across a warm reboot, so once set, a limit outlives the configuration that
+set it and the port never follows its PD's class again.
+
+Add a per-port power_limit_class file next to detection_legacy. It reads 1
+while the port is limited by class, and writing 1 puts it back there the way
+the stock firmware does: it programs the 33 W cap with SET_POWER_LIMIT (0.2 W
+steps) and then limit type 1. The limit type is byte 2 of the
+GET_PORT_EXT_CONFIG reply. Only the Gen2 encoding is known, so Gen1
+controllers do not get the file.
+
+This is an OpenWrt-local extension on top of 899.
+
+--- a/drivers/net/pse-pd/realtek-pse-mcu-core.c
++++ b/drivers/net/pse-pd/realtek-pse-mcu-core.c
+@@ -63,8 +63,16 @@
+ #define RTPSE_MCU_PORT_STS_REQUESTING		0x06
+ 
+ /* RTPSE_MCU_PORT_SET_POWER_LIMIT_TYPE values */
++#define RTPSE_MCU_PORT_PW_LIMIT_TYPE_CLASS	0x01	/* Gen2; the MCU's default */
+ #define RTPSE_MCU_PORT_PW_LIMIT_TYPE_USER	0x02
+ 
++/*
++ * The cap the stock firmware programs, through RTPSE_MCU_CMD_PORT_SET_POWER_LIMIT
++ * in 0.2 W steps, before it puts a port back on class-based limiting.
++ */
++#define RTPSE_MCU_PORT_PW_LIMIT_CLASS_MW	33000
++#define RTPSE_MCU_PORT_PW_LIMIT_LSB_MW		200
++
+ #define RTPSE_MCU_MAX_PORTS			48
+ #define RTPSE_MCU_PORT_MAX_PRIORITY		3
+ 
+@@ -167,6 +175,7 @@ struct rtpse_mcu_port_config {
+ };
+ 
+ struct rtpse_mcu_port_ext_config {
++	u8 limit_type;
+ 	u8 max_power;
+ 	u8 priority;
+ };
+@@ -207,6 +216,12 @@ struct rtpse_mcu_dialect {
+ 	 */
+ 	u8 detect_standard;
+ 	u8 detect_legacy;
++
++	/*
++	 * Whether a port can be put back on class-based limiting. The limit
++	 * type encoding is known from the Gen2 stock firmware only.
++	 */
++	bool pw_limit_class;
+ };
+ 
+ struct rtpse_mcu_chip_info {
+@@ -702,6 +717,7 @@ static int rtpse_mcu_port_get_ext_config
+ 	if (ret)
+ 		return ret;
+ 
++	config->limit_type = resp.payload[2];
+ 	config->max_power = resp.payload[3];
+ 	config->priority = resp.payload[4];
+ 
+@@ -973,9 +989,10 @@ static const struct pse_controller_ops r
+  * Per-port controls, exposed under sysfs as one directory per port:
+  *
+  *   <dev>/port<N>/detection_legacy
++ *   <dev>/port<N>/power_limit_class
+  *
+  * Each port gets its own attribute group so further per-port knobs can be
+- * added as files alongside detection_legacy later.
++ * added as files alongside these later.
+  *
+  * detection_legacy widens the PD detection window. That window is normally
+  * kept narrow on purpose: it is the safety check that stops the PSE from
+@@ -991,6 +1008,35 @@ static const struct pse_controller_ops r
+  * force-powering devices that fail classification) are deliberately left out
+  * of this stable interface.
+  */
++/*
++ * power_limit_class reads 1 while the port is limited by its PD's class, the
++ * MCU's default, and 0 once a user-defined limit is set through ethtool.
++ * Writing 1 puts the port back on class-based limiting: setting a limit
++ * switches the MCU to a user-defined one, and the PSE core has no call to
++ * clear it again. The MCU keeps the setting across a warm reboot, so without
++ * this a limit outlives the configuration that set it.
++ */
++static int rtpse_mcu_port_set_pw_limit_class(struct rtpse_mcu_ctrl *pse, unsigned int port)
++{
++	const struct rtpse_mcu_opcode *type_opc, *val_opc;
++	int ret;
++
++	type_opc = &pse->dialect->opcode[RTPSE_MCU_CMD_PORT_SET_POWER_LIMIT_TYPE];
++	val_opc = &pse->dialect->opcode[RTPSE_MCU_CMD_PORT_SET_POWER_LIMIT];
++	if (!pse->dialect->pw_limit_class || !type_opc->valid || !val_opc->valid)
++		return -EOPNOTSUPP;
++
++	/* Restore the stock cap first, in the order the stock firmware uses. */
++	ret = rtpse_mcu_port_cmd(pse, port, val_opc->op,
++				 RTPSE_MCU_PORT_PW_LIMIT_CLASS_MW /
++				 RTPSE_MCU_PORT_PW_LIMIT_LSB_MW);
++	if (ret)
++		return ret;
++
++	return rtpse_mcu_port_cmd(pse, port, type_opc->op,
++				  RTPSE_MCU_PORT_PW_LIMIT_TYPE_CLASS);
++}
++
+ static int rtpse_mcu_port_set_detection_type(struct rtpse_mcu_ctrl *pse, unsigned int port,
+ 					     u8 type)
+ {
+@@ -1016,7 +1062,8 @@ struct rtpse_mcu_port_attr {
+  */
+ struct rtpse_mcu_port_sysfs {
+ 	struct rtpse_mcu_port_attr detection_legacy;
+-	struct attribute *attrs[2];
++	struct rtpse_mcu_port_attr power_limit_class;
++	struct attribute *attrs[3];
+ 	struct attribute_group group;
+ };
+ 
+@@ -1060,6 +1107,45 @@ static ssize_t detection_legacy_store(st
+ 	return count;
+ }
+ 
++static ssize_t power_limit_class_show(struct device *dev, struct device_attribute *attr,
++				      char *buf)
++{
++	struct rtpse_mcu_port_attr *pa =
++		container_of(attr, struct rtpse_mcu_port_attr, attr);
++	struct rtpse_mcu_port_ext_config config;
++	int ret;
++
++	ret = rtpse_mcu_port_get_ext_config(pa->pse, pa->port, &config);
++	if (ret)
++		return ret;
++
++	return sysfs_emit(buf, "%u\n",
++			  config.limit_type == RTPSE_MCU_PORT_PW_LIMIT_TYPE_CLASS);
++}
++
++static ssize_t power_limit_class_store(struct device *dev, struct device_attribute *attr,
++				       const char *buf, size_t count)
++{
++	struct rtpse_mcu_port_attr *pa =
++		container_of(attr, struct rtpse_mcu_port_attr, attr);
++	bool class;
++	int ret;
++
++	ret = kstrtobool(buf, &class);
++	if (ret)
++		return ret;
++
++	/* A user-defined limit is set with ethtool, which also says how much. */
++	if (!class)
++		return -EINVAL;
++
++	ret = rtpse_mcu_port_set_pw_limit_class(pa->pse, pa->port);
++	if (ret)
++		return ret;
++
++	return count;
++}
++
+ /*
+  * A device_attribute carrying its controller, so these do not need drvdata:
+  * that belongs to the transport driver.
+@@ -1151,6 +1237,7 @@ static int rtpse_mcu_sysfs_init(struct r
+ 
+ 	for (i = 0; i < n; i++) {
+ 		struct rtpse_mcu_port_sysfs *p = &ports[i];
++		unsigned int k = 0;
+ 
+ 		sysfs_attr_init(&p->detection_legacy.attr.attr);
+ 		p->detection_legacy.attr.attr.name = "detection_legacy";
+@@ -1160,8 +1247,20 @@ static int rtpse_mcu_sysfs_init(struct r
+ 		p->detection_legacy.pse = pse;
+ 		p->detection_legacy.port = i;
+ 
+-		p->attrs[0] = &p->detection_legacy.attr.attr;
+-		p->attrs[1] = NULL;
++		p->attrs[k++] = &p->detection_legacy.attr.attr;
++
++		if (pse->dialect->pw_limit_class) {
++			sysfs_attr_init(&p->power_limit_class.attr.attr);
++			p->power_limit_class.attr.attr.name = "power_limit_class";
++			p->power_limit_class.attr.attr.mode = 0600;
++			p->power_limit_class.attr.show = power_limit_class_show;
++			p->power_limit_class.attr.store = power_limit_class_store;
++			p->power_limit_class.pse = pse;
++			p->power_limit_class.port = i;
++			p->attrs[k++] = &p->power_limit_class.attr.attr;
++		}
++
++		p->attrs[k] = NULL;
+ 
+ 		p->group.name = devm_kasprintf(pse->dev, GFP_KERNEL, "port%u", i);
+ 		if (!p->group.name)
+@@ -1438,6 +1537,7 @@ static const struct rtpse_mcu_dialect rt
+ 	.mcu_type_str      = rtpse_mcu_gen2_mcu_type_str,
+ 	.detect_standard   = 0x0,
+ 	.detect_legacy     = 0x1,
++	.pw_limit_class    = true,
+ 	.opcode = {
+ 		[RTPSE_MCU_CMD_SET_GLOBAL_STATE]	= RTPSE_MCU_OP(0x00),
+ 		[RTPSE_MCU_CMD_GET_SYSTEM_INFO]		= RTPSE_MCU_OP(0x40),
