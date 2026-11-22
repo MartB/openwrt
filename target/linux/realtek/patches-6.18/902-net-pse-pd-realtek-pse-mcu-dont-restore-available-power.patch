@@ -1,0 +1,191 @@
+From: OpenWrt local
+Subject: net: pse-pd: realtek-pse-mcu: don't write the available power back as the budget
+
+Before programming the vmain budget, the driver saves the old one from the
+GET_POWER_STATUS reply, to restore it if probe fails later. The budget is
+not in that reply: payload[2..3] is the power still available, the budget
+minus what the ports draw, and only payload[4], the active power bank, is
+budget-related. A failed probe would program the budget minus the current
+draw, and shrink it again on every retry, taking power from ports that are
+delivering.
+
+No command the stock firmware uses in normal operation reads the configured
+budget back, so read only the bank index and drop the restore. A probe
+failure now leaves the new budget in place, as a normal removal already
+does; it is the supply's own figure, and the next probe programs it again.
+
+On a Zyxel XMG1915-10EP, whose stock firmware programs 135 W, payload[2..3]
+reads 128000 mW with one PD drawing 6.9 W and 124000 with two drawing
+11.3 W.
+
+This is an OpenWrt-local fix on top of 817-02.
+
+--- a/drivers/net/pse-pd/realtek-pse-mcu-core.c
++++ b/drivers/net/pse-pd/realtek-pse-mcu-core.c
+@@ -492,8 +492,13 @@ static int rtpse_mcu_set_power_managemen
+ 	return (resp.payload[0] == 0x0) ? 0 : -EIO;
+ }
+ 
+-static int rtpse_mcu_get_global_budget(struct rtpse_mcu_ctrl *pse, u8 *budget_idx,
+-				       u16 *budget_raw)
++/*
++ * The active power bank is the only budget-related field GET_POWER_STATUS
++ * returns. payload[2..3] is the power still *available* (budget minus what the
++ * ports draw or have allocated), not the configured budget, so there is
++ * nothing here to save and write back later.
++ */
++static int rtpse_mcu_get_budget_idx(struct rtpse_mcu_ctrl *pse, u8 *budget_idx)
+ {
+ 	struct rtpse_mcu_msg req, resp;
+ 	const struct rtpse_mcu_opcode *opc;
+@@ -512,7 +517,6 @@ static int rtpse_mcu_get_global_budget(s
+ 		return -ERANGE;
+ 
+ 	*budget_idx = resp.payload[4];
+-	*budget_raw = get_unaligned_be16(&resp.payload[2]);
+ 	return 0;
+ }
+ 
+@@ -541,16 +545,6 @@ static int rtpse_mcu_set_global_budget(s
+ 	return 0;
+ }
+ 
+-static void rtpse_mcu_restore_global_budget(struct rtpse_mcu_ctrl *pse,
+-					    u8 budget_idx, u16 budget_raw)
+-{
+-	int ret;
+-
+-	ret = rtpse_mcu_set_global_budget(pse, budget_idx, budget_raw);
+-	if (ret)
+-		dev_warn(pse->dev, "failed to restore global power budget: %d\n", ret);
+-}
+-
+ static void rtpse_mcu_free_global_budget(void *data)
+ {
+ 	struct rtpse_mcu_ctrl *pse = data;
+@@ -558,13 +552,18 @@ static void rtpse_mcu_free_global_budget
+ 	regulator_free_power_budget(pse->vmain, pse->requested_budget_mW);
+ }
+ 
++/*
++ * The previous budget cannot be read back, so a later probe failure leaves the
++ * one programmed here in place, as a normal removal does. It is the supply's
++ * own figure and the next probe programs it again; writing anything else back
++ * could only take power away from ports that are delivering.
++ */
+ static int rtpse_mcu_apply_global_budget(struct rtpse_mcu_ctrl *pse,
+-					 struct regulator *vmain,
+-					 u8 *budget_idx,
+-					 u16 *old_budget_raw)
++					 struct regulator *vmain)
+ {
+ 	int budget, ret;
+ 	u16 budget_raw;
++	u8 budget_idx;
+ 
+ 	budget = regulator_get_unclaimed_power_budget(vmain);
+ 	if (budget == INT_MAX)
+@@ -579,26 +578,23 @@ static int rtpse_mcu_apply_global_budget
+ 	if (ret)
+ 		return ret;
+ 
+-	ret = rtpse_mcu_get_global_budget(pse, budget_idx, old_budget_raw);
++	ret = rtpse_mcu_get_budget_idx(pse, &budget_idx);
+ 	if (ret)
+ 		goto err_free_budget;
+ 
+ 	pse->vmain = vmain;
+ 	pse->requested_budget_mW = budget;
+ 
+-	ret = rtpse_mcu_set_global_budget(pse, *budget_idx, budget_raw);
++	ret = rtpse_mcu_set_global_budget(pse, budget_idx, budget_raw);
+ 	if (ret)
+-		goto err_restore_budget;
++		goto err_free_budget;
+ 
+ 	ret = devm_add_action(pse->dev, rtpse_mcu_free_global_budget, pse);
+ 	if (ret)
+-		goto err_restore_budget;
++		goto err_free_budget;
+ 
+ 	return 0;
+ 
+-err_restore_budget:
+-	rtpse_mcu_restore_global_budget(pse, *budget_idx, *old_budget_raw);
+-
+ err_free_budget:
+ 	regulator_free_power_budget(vmain, budget);
+ 	return ret;
+@@ -1253,8 +1249,6 @@ int rtpse_mcu_register(struct rtpse_mcu_
+ 	struct rtpse_mcu_info info;
+ 	struct gpio_desc *gpiod;
+ 	struct regulator *vmain;
+-	u16 old_budget_raw;
+-	u8 budget_idx;
+ 	int ret;
+ 
+ 	BUILD_BUG_ON(sizeof(struct rtpse_mcu_msg) != RTPSE_MCU_MSG_SIZE);
+@@ -1326,12 +1320,8 @@ int rtpse_mcu_register(struct rtpse_mcu_
+ 		dev_warn_probe(pse->dev, ret, "failed to set power management mode\n");
+ 
+ 	if (vmain) {
+-		ret = rtpse_mcu_apply_global_budget(pse, vmain,
+-						    &budget_idx,
+-						    &old_budget_raw);
+-		if (ret == -ENODATA)
+-			vmain = NULL;
+-		else if (ret)
++		ret = rtpse_mcu_apply_global_budget(pse, vmain);
++		if (ret && ret != -ENODATA)
+ 			return dev_err_probe(pse->dev, ret,
+ 					     "failed to apply global power budget\n");
+ 	}
+@@ -1341,16 +1331,14 @@ int rtpse_mcu_register(struct rtpse_mcu_
+ 		/* Dialects without a global-state concept (e.g. Gen1) return
+ 		 * -EOPNOTSUPP; treat that as "no separate enable required".
+ 		 */
+-		if (ret && ret != -EOPNOTSUPP) {
+-			ret = dev_err_probe(pse->dev, ret,
+-					    "failed to enable PSE system\n");
+-			goto err_restore_budget;
+-		}
++		if (ret && ret != -EOPNOTSUPP)
++			return dev_err_probe(pse->dev, ret,
++					     "failed to enable PSE system\n");
+ 		if (!ret) {
+ 			ret = devm_add_action_or_reset(pse->dev,
+ 						       rtpse_mcu_global_disable, pse);
+ 			if (ret)
+-				goto err_restore_budget;
++				return ret;
+ 		}
+ 	}
+ 
+@@ -1372,24 +1360,13 @@ int rtpse_mcu_register(struct rtpse_mcu_
+ 
+ 	ret = devm_pse_controller_register(pse->dev, &pse->pcdev);
+ 	if (ret)
+-		goto err_restore_budget;
++		return ret;
+ 
+ 	ret = rtpse_mcu_sysfs_init(pse);
+ 	if (ret)
+-		goto err_restore_budget;
+-
+-	ret = rtpse_mcu_power_sysfs_init(pse);
+-	if (ret)
+-		goto err_restore_budget;
+-
+-	return 0;
+-
+-err_restore_budget:
+-	if (vmain)
+-		rtpse_mcu_restore_global_budget(pse, budget_idx,
+-						old_budget_raw);
++		return ret;
+ 
+-	return ret;
++	return rtpse_mcu_power_sysfs_init(pse);
+ }
+ EXPORT_SYMBOL_GPL(rtpse_mcu_register);
+ 
