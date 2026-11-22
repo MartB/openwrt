@@ -1985,10 +1985,22 @@ static const s16 rtpcs_93xx_sds_usxgmii_submodes[RTPCS_SDS_USXGMII_SM_MAX] = {
 	[RTPCS_SDS_USXGMII_SM_2_5GSXGMII] = RTPCS_93XX_SDS_USXGMII_SUBMODE_2_5GSX,
 };
 
+/*
+ * Alignment-marker spacing for 10G-QXGMII, in units of roughly 0.64 us. The
+ * RTL8224 corrupts frames that last longer on the wire than this spacing: with
+ * the SDK value of 0xa4 (about 105 us) that is about 3% of full-size frames at
+ * 100M and most frames at 10M. 0x5078 (about 13 ms) is what ZyNOS programs on
+ * both sides of an RTL8224 link, and it covers 9k jumbo frames at 10M. The PHY
+ * driver programs the same spacing on its side, and the two must match or the
+ * link stops passing traffic.
+ */
+#define RTPCS_93XX_QXGMII_AM_PERIOD	0x5078
+
 static int rtpcs_93xx_sds_apply_usxgmii_submode(struct rtpcs_serdes *sds,
 						enum rtpcs_sds_usxgmii_submode submode)
 {
 	s16 val = rtpcs_93xx_sds_usxgmii_submodes[submode];
+	int ret;
 
 	if (val < 0)
 		return 0;
@@ -1996,7 +2008,16 @@ static int rtpcs_93xx_sds_apply_usxgmii_submode(struct rtpcs_serdes *sds,
 	if (!sds->swcore_regs.usxgmii_submode)
 		return -EOPNOTSUPP;
 
-	return regmap_field_write(sds->swcore_regs.usxgmii_submode, val);
+	ret = regmap_field_write(sds->swcore_regs.usxgmii_submode, val);
+	if (ret)
+		return ret;
+
+	if (submode != RTPCS_SDS_USXGMII_SM_10GQXGMII)
+		return 0;
+
+	return rtpcs_sds_write_mask(sds, PAGE_TGR_PRO_0, TGR_PRO_0_REG18,
+				    RTL93XX_CFG_AM_INSERT_PERIOD,
+				    RTPCS_93XX_QXGMII_AM_PERIOD);
 }
 
 static int rtpcs_93xx_sds_set_mac_mode(struct rtpcs_serdes *sds, enum rtpcs_sds_mode hw_mode)
