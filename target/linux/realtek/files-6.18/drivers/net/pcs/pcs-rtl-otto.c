@@ -668,6 +668,7 @@ struct rtpcs_serdes {
 	struct delayed_work cali_work;
 	enum rtpcs_rx_phase rx_phase;
 	u8 rxcal_tries;
+	bool rxcal_failed;
 	struct delayed_work linkmon_work;
 	u8 rxmon_down;
 	u64 rxmon_recovery_after;
@@ -2178,8 +2179,22 @@ static void rtpcs_93xx_rx_cali_work_handler(struct work_struct *work)
 					      msecs_to_jiffies(RTPCS_RXCAL_RETRY_MS));
 			goto unlock;
 		}
-		dev_warn(sds->ctrl->dev, "SerDes %u: RX calibration did not pass after %u attempts: %d\n",
-			 sds->id, sds->rxcal_tries, ret);
+		/*
+		 * With no light on an SFP the RX idle detector still sees
+		 * activity, so calibration is retried, and fails, on every
+		 * link-loss recovery. Warn once until a calibration passes.
+		 */
+		if (!sds->rxcal_failed)
+			dev_warn(sds->ctrl->dev,
+				 "SerDes %u: RX calibration did not pass after %u attempts: %d\n",
+				 sds->id, sds->rxcal_tries, ret);
+		else
+			dev_dbg(sds->ctrl->dev,
+				"SerDes %u: RX calibration did not pass after %u attempts: %d\n",
+				sds->id, sds->rxcal_tries, ret);
+		sds->rxcal_failed = true;
+	} else {
+		sds->rxcal_failed = false;
 	}
 	rtpcs_93xx_sds_arm_linkmon(sds);
 unlock:
