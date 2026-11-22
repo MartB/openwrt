@@ -599,6 +599,10 @@ struct otto_dsa_priv {
 	struct workqueue_struct *wq;
 	bool eee_enabled;
 	unsigned long mc_group_bm[MAX_MC_GROUPS >> 5];
+	/* Joins per multicast group and port: an L2 entry stands for every IP
+	 * group that maps to its MAC, and the bridge adds and deletes each.
+	 */
+	u8 mc_refs[MAX_MC_GROUPS][57];
 	struct rhashtable tc_ht;
 	bool tc_initialized;
 	struct mutex tc_flow_lock;	/* Serializes tc flower add/del/stats */

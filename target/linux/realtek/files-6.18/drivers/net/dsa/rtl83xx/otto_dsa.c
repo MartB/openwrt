@@ -436,6 +436,8 @@ static int otto_dsa_83xx_mc_group_alloc(struct otto_dsa_priv *priv, int port)
 	set_bit(mc_group, priv->mc_group_bm);
 	portmask = BIT_ULL(port);
 	priv->r->write_mcast_pmask(mc_group, portmask);
+	memset(priv->mc_refs[mc_group], 0, sizeof(priv->mc_refs[mc_group]));
+	priv->mc_refs[mc_group][port] = 1;
 
 	return mc_group;
 }
@@ -446,6 +448,8 @@ static u64 otto_dsa_83xx_mc_group_add_port(struct otto_dsa_priv *priv, int mc_gr
 
 	pr_debug("%s: %d\n", __func__, port);
 
+	if (mc_group < MAX_MC_GROUPS && priv->mc_refs[mc_group][port] < U8_MAX)
+		priv->mc_refs[mc_group][port]++;
 	portmask |= BIT_ULL(port);
 	priv->r->write_mcast_pmask(mc_group, portmask);
 
@@ -458,6 +462,13 @@ static u64 otto_dsa_mc_group_del_port(struct otto_dsa_priv *priv, int mc_group, 
 
 	pr_debug("%s: %d\n", __func__, port);
 
+	/* another IP group with this MAC still wants the port */
+	if (mc_group < MAX_MC_GROUPS && priv->mc_refs[mc_group][port] > 1) {
+		priv->mc_refs[mc_group][port]--;
+		return portmask;
+	}
+	if (mc_group < MAX_MC_GROUPS)
+		priv->mc_refs[mc_group][port] = 0;
 	portmask &= ~BIT_ULL(port);
 	priv->r->write_mcast_pmask(mc_group, portmask);
 	if (!portmask)
