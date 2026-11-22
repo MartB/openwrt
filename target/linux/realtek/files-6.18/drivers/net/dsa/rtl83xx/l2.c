@@ -1050,6 +1050,7 @@ static void otto_l2_930x_fill_entry(u32 r[], struct otto_l2_entry *e)
 	} else {
 		e->valid = true;
 		e->type = L2_MULTICAST;
+		e->vid = e->rvid;
 		e->mc_portmask_index = (r[2] >> 16) & 0x3ff;
 	}
 }
@@ -1072,12 +1073,13 @@ static void otto_l2_930x_fill_row(u32 r[], struct otto_l2_entry *e)
 	       ((u32)e->mac[3]);
 	r[1] = ((u32)e->mac[4]) << 24 |
 	       ((u32)e->mac[5]) << 16;
+	/* FID_RVID: unicast and multicast entries alike */
+	r[1] |= e->rvid & 0xfff;
 
 	r[2] |= e->next_hop ? BIT(12) : 0;
 
 	if (e->type == L2_UNICAST) {
 		r[2] |= e->is_static ? BIT(14) : 0;
-		r[1] |= e->rvid & 0xfff;
 		if (e->is_trunk) {
 			r[2] |= BIT(30);
 			port = e->stack_dev << 9 | (e->port & 0x3f);

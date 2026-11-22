@@ -582,7 +582,18 @@ static int otto_dsa_93xx_port_mdb_add(struct dsa_switch *ds, int port,
 				      const struct switchdev_obj_port_mdb *mdb,
 				      const struct dsa_db db)
 {
-	return -EOPNOTSUPP;
+	struct otto_dsa_priv *priv = ds->priv;
+
+	/* The RTL930x keeps L2 multicast entries in the L2 table with an index
+	 * into the multicast portmask table, as the RTL83xx do. IGMP and MLD
+	 * are trapped to the CPU (VLAN_APP_PKT_CTRL), so the bridge keeps
+	 * seeing reports for groups already in the table. The RTL931x entry
+	 * layout is not verified yet.
+	 */
+	if (priv->family_id != RTL9300_FAMILY_ID)
+		return -EOPNOTSUPP;
+
+	return otto_dsa_83xx_port_mdb_add(ds, port, mdb, db);
 }
 
 static int otto_dsa_port_mdb_del(struct dsa_switch *ds, int port,
