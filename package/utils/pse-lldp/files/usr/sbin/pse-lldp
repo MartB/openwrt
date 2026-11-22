@@ -1,0 +1,299 @@
+#!/usr/bin/ucode -S
+// pse-lldp -- answer LLDP power requests from powered devices.
+//
+// A PD that speaks LLDP (802.3at DLL or LLDP-MED) says how much power it
+// needs, which can be less than its class allows. lldpd receives that but
+// does nothing with it. This reads the requests from lldpd, sets the port's
+// PoE limit to the requested power, and answers with the power allocated, so
+// the PD knows what it may draw.
+//
+// A request for the full class power changes nothing: the port stays on the
+// MCU's class-based limit. A port with pse_power_limit configured is left to
+// that limit; its allocation is still advertised. When a request goes away
+// the port goes back to its class-based limit.
+//
+// One "ethtool --show-pse" is several round trips over the PSE MCU's UART, so
+// the MCU is only asked when a request changes.
+
+'use strict';
+
+import { popen, readfile, glob, open, stat } from 'fs';
+import { cursor } from 'uci';
+import * as uloop from 'uloop';
+
+const INTERVAL_MS = 10000;
+
+// Per 802.3 class: the most a PD may draw, and the least the PSE must supply
+// for it, which includes the loss on 100 m of cable. Classes 5..8 are 802.3bt.
+const CLASS_PD  = [ 13000, 3840, 6490, 13000, 25500, 40000, 51000, 62000, 71300 ];
+const CLASS_PSE = [ 15400, 4000, 7000, 15400, 30000, 45000, 60000, 75000, 90000 ];
+
+// Never cap a port below what it draws now plus this margin.
+const DRAW_MARGIN_MW = 2000;
+
+let pse_root = null;
+let lldpd_gen = null;
+let ports = {};		// per port: what was done last
+let first_tick = true;
+
+function log(msg) {
+	system([ 'logger', '-t', 'pse-lldp', msg ]);
+}
+
+function sh(cmd) {
+	const fd = popen(cmd, 'r');
+	if (!fd)
+		return '';
+	const out = fd.read('all') ?? '';
+	fd.close();
+	return out;
+}
+
+function find_pse_root() {
+	for (let pat in [ '/sys/bus/serial/devices/*/port0/power_limit_class',
+			  '/sys/devices/platform/*/*/*/port0/power_limit_class',
+			  '/sys/devices/platform/*/*/port0/power_limit_class' ])
+		for (let f in glob(pat) ?? [])
+			return replace(f, /\/port0\/power_limit_class$/, '');
+	return null;
+}
+
+function pse_index(port) {
+	const m = match(port, /^lan([0-9]+)$/);
+	return m ? (+m[1] - 1) : null;
+}
+
+function limit_class_path(port) {
+	const idx = pse_index(port);
+	return (idx != null && pse_root) ? `${pse_root}/port${idx}/power_limit_class` : null;
+}
+
+function read_limit_class(port) {
+	const p = limit_class_path(port);
+	const v = p ? trim(readfile(p) ?? '') : '';
+	return length(v) ? (v == '1') : null;
+}
+
+function set_limit_class(port) {
+	const p = limit_class_path(port);
+	const fd = p ? open(p, 'w') : null;
+	if (!fd)
+		return false;
+	const ok = fd.write('1\n') != null;
+	fd.close();
+	return ok;
+}
+
+function set_limit(port, mw) {
+	return system([ 'ethtool', '--set-pse', port, 'c33-pse-avail-pw-limit', `${mw}` ]) == 0;
+}
+
+// PSE state of one port, from the MCU.
+function read_pse(port) {
+	const out = sh(`ethtool --show-pse ${port} 2>/dev/null`);
+	const num = (re) => { const m = match(out, re); return m ? +m[1] : null; };
+
+	if (!match(out, /PSE attributes/))
+		return null;
+
+	return {
+		delivering: match(out, /Detection Status:\s*delivering/) != null,
+		class: num(/Power Class:\s*([0-9]+)/),
+		power_mw: num(/Actual Power:\s*([0-9]+)/) ?? 0,
+	};
+}
+
+// Power requests from LLDP neighbours, keyed by port. The 802.3at DLL
+// request wins over LLDP-MED's when a PD sends both.
+function read_requests() {
+	const req = {};
+
+	for (let line in split(sh('lldpcli -f keyvalue show neighbors details 2>/dev/null'), '\n')) {
+		const m = match(line, /^lldp\.([^.]+)\.(.+)=(.*)$/);
+		if (!m)
+			continue;
+
+		if (!req[m[1]])
+			req[m[1]] = {};
+		const r = req[m[1]];
+		switch (m[2]) {
+		case 'port.power.device-type':	r.dot3_pd = (m[3] == 'PD'); break;
+		case 'port.power.requested':	r.dot3 = +m[3]; break;
+		case 'lldp-med.poe.device-type': r.med_pd = (m[3] == 'PD'); break;
+		case 'lldp-med.poe.power':	r.med = +m[3]; break;
+		case 'lldp-med.poe.priority':	r.prio = m[3]; break;
+		}
+	}
+
+	const out = {};
+	for (let port, r in req) {
+		let mw = null;
+		if (r.dot3_pd && r.dot3 > 0)
+			mw = r.dot3;
+		else if (r.med_pd && r.med > 0)
+			mw = r.med;
+		if (mw != null)
+			out[port] = mw;
+	}
+
+	return out;
+}
+
+// Configured limits: those belong to the user, not to LLDP.
+function read_configured() {
+	const cfg = {};
+	const u = cursor();
+
+	u.load('network');
+	u.foreach('network', 'device', (s) => {
+		if (s.name && s.pse_power_limit)
+			cfg[s.name] = +s.pse_power_limit;
+	});
+
+	return cfg;
+}
+
+function advertise(port, cls, requested, allocated) {
+	const c = (cls != null && cls < 4) ? cls : 4;
+
+	system(sprintf('lldpcli configure ports %s dot3 power pse supported enabled paircontrol ' +
+		       'powerpairs signal class class-%d type 2 source primary priority unknown ' +
+		       'requested %d allocated %d >/dev/null 2>&1', port, c, requested, allocated));
+	system(sprintf('lldpcli configure ports %s med power pse source primary priority unknown ' +
+		       'value %d >/dev/null 2>&1', port, allocated));
+}
+
+// Work out the limit for one request and apply it. Returns what to advertise.
+function grant(port, want_mw, configured_mw) {
+	const pse = read_pse(port);
+	if (!pse || !pse.delivering || pse.class == null || pse.class >= length(CLASS_PD))
+		return null;
+
+	const cls = pse.class;
+	const pd_max = CLASS_PD[cls], pse_max = CLASS_PSE[cls];
+	const granted = min(want_mw, pd_max);
+
+	if (configured_mw != null) {
+		// The configured limit is at the PSE; tell the PD what reaches it.
+		const reach = int(configured_mw * pd_max / pse_max);
+		return { cls, requested: want_mw, allocated: min(granted, reach), limit: null };
+	}
+
+	// What the PSE has to supply for that, cable loss included, in 0.1 W.
+	let limit = int((granted * pse_max + pd_max - 1) / pd_max);
+	limit = int((limit + 99) / 100) * 100;
+
+	if (limit < pse.power_mw + DRAW_MARGIN_MW) {
+		log(sprintf('%s: requests %d mW but draws %d mW; not capping below the draw',
+			    port, want_mw, pse.power_mw));
+		limit = pse.power_mw + DRAW_MARGIN_MW;
+	}
+
+	if (limit >= pse_max) {
+		set_limit_class(port);
+		limit = null;
+	} else {
+		set_limit(port, limit);
+	}
+
+	return { cls, requested: want_mw, allocated: granted, limit };
+}
+
+// The request is gone: the PD left, or stopped asking (an lldpd restart
+// does that for up to a TTL). Go back to the class-based limit and say so,
+// rather than telling a PD that may still be there that it gets nothing.
+function release(port, st) {
+	if (st.limit != null) {
+		set_limit_class(port);
+		log(sprintf('%s: request gone, back to the class-based limit', port));
+	}
+	advertise(port, st.cls, 0,
+		  st.configured != null ? st.allocated : CLASS_PD[st.cls]);
+}
+
+function tick() {
+	// lldpd writes no pid file here; it recreates its socket on every start.
+	const sock = stat('/var/run/lldpd.socket');
+	if (!sock)
+		return;		// lldpd not running; try again next tick
+
+	// A restarted lldpd has forgotten what we advertised.
+	const gen = `${sock.inode}:${sock.mtime}`;
+	if (gen != lldpd_gen) {
+		lldpd_gen = gen;
+		for (let port, st in ports)
+			st.advertised = false;
+	}
+
+	const requests = read_requests();
+	const configured = read_configured();
+
+	// A limit an earlier run set outlives it; put such ports back once.
+	if (first_tick) {
+		first_tick = false;
+		for (let i = 1; i <= 48; i++) {
+			const port = `lan${i}`;
+			if (!limit_class_path(port) || readfile(limit_class_path(port)) == null)
+				break;
+			if (requests[port] == null && configured[port] == null &&
+			    read_limit_class(port) === false) {
+				set_limit_class(port);
+				log(sprintf('%s: no request and no configured limit, back to the class-based limit', port));
+			}
+		}
+	}
+
+	for (let port in keys(ports)) {
+		if (requests[port] == null) {
+			release(port, ports[port]);
+			delete ports[port];
+		}
+	}
+
+	for (let port, mw in requests) {
+		if (pse_index(port) == null)
+			continue;
+
+		const st = ports[port];
+		const cfg = configured[port];
+
+		if (st && st.want == mw && st.configured == cfg) {
+			if (!st.advertised) {
+				advertise(port, st.cls, st.requested, st.allocated);
+				st.advertised = true;
+			}
+			continue;
+		}
+
+		const g = grant(port, mw, cfg);
+		if (!g)
+			continue;	// not powered (yet); look again next tick
+
+		ports[port] = {
+			cls: g.cls, requested: g.requested, allocated: g.allocated,
+			limit: g.limit, want: mw, configured: cfg, advertised: true,
+		};
+		advertise(port, g.cls, g.requested, g.allocated);
+
+		log(sprintf('%s: class %d PD requests %d mW, allocated %d mW, %s', port, g.cls,
+			    mw, g.allocated,
+			    cfg != null ? `configured limit ${cfg} mW kept` :
+			    g.limit != null ? `port limit ${g.limit} mW` : 'class-based limit'));
+	}
+}
+
+pse_root = find_pse_root();
+if (!pse_root) {
+	warn('pse-lldp: no PSE with power_limit_class found\n');
+	exit(1);
+}
+
+uloop.init();
+
+let t;
+t = uloop.timer(1000, () => {
+	tick();
+	t.set(INTERVAL_MS);
+});
+
+uloop.run();
