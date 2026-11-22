@@ -257,6 +257,14 @@
 	};
 };
 
+/*
+ * What the stock firmware programs into the MCU: its 180 W "pwr pse max power"
+ * plus its 15 W "pwr guard band". Untested, like the rest of this board.
+ */
+&poe_supply {
+	regulator-power-budget-milliwatt = <195000>;
+};
+
 &pse {
 	compatible = "zyxel,xmg1915-18ep-pse", "realtek,pse-mcu-gen2";
 };

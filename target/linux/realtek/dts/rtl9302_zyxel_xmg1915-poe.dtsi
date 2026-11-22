@@ -5,6 +5,19 @@
  * the first eight copper ports. Boards set their own compatible on &pse.
  */
 
+/ {
+	/*
+	 * The PoE supply. Each board adds its budget below; without one the
+	 * driver leaves the MCU on whatever budget it already has.
+	 */
+	poe_supply: supply-poe {
+		compatible = "regulator-fixed";
+		regulator-name = "poe-supply";
+		regulator-always-on;
+		regulator-boot-on;
+	};
+};
+
 &uart1 {
 	status = "okay";
 
@@ -13,6 +26,7 @@
 		current-speed = <115200>;
 
 		reset-gpios = <&gpio0 4 GPIO_ACTIVE_LOW>;
+		vmain-supply = <&poe_supply>;
 
 		pse-pis {
 			#address-cells = <1>;
