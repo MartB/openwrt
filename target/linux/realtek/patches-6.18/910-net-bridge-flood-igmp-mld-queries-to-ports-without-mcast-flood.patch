@@ -1,0 +1,54 @@
+From: Martin
+Subject: net: bridge: flood IGMP/MLD queries to ports without mcast_flood
+
+A port with mcast_flood off drops multicast that has no MDB entry, and so
+the IGMP and MLD queries too: the hosts behind it never answer a query,
+their memberships time out, and with them the groups that were the point
+of turning flooding off (RFC 4541 2.1.1: queries go to all ports). Flood
+the queries the snooping code recognised regardless of mcast_flood.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+--- a/net/bridge/br_forward.c
++++ b/net/bridge/br_forward.c
+@@ -15,6 +15,8 @@
+ #include <linux/skbuff.h>
+ #include <linux/if_vlan.h>
+ #include <linux/netfilter_bridge.h>
++#include <linux/igmp.h>
++#include <linux/icmpv6.h>
+ #include "br_private.h"
+ 
+ /* Don't forward packets to originating port or forwarding disabled */
+@@ -197,6 +199,21 @@
+ 	return p;
+ }
+ 
++/* An IGMP/MLD query, as the snooping code saw it. A port that floods no
++ * multicast still gets these: without them the hosts behind it never renew
++ * their memberships, and the groups snooped there time out.
++ */
++static bool br_skb_is_mc_query(const struct sk_buff *skb)
++{
++#ifdef CONFIG_BRIDGE_IGMP_SNOOPING
++	u8 type = BR_INPUT_SKB_CB(skb)->igmp;
++
++	return type == IGMP_HOST_MEMBERSHIP_QUERY || type == ICMPV6_MGM_QUERY;
++#else
++	return false;
++#endif
++}
++
+ /* called under rcu_read_lock */
+ void br_flood(struct net_bridge *br, struct sk_buff *skb,
+ 	      enum br_pkt_type pkt_type, bool local_rcv, bool local_orig,
+@@ -219,7 +236,8 @@
+ 				continue;
+ 			break;
+ 		case BR_PKT_MULTICAST:
+-			if (!(p->flags & BR_MCAST_FLOOD) && skb->dev != br->dev)
++			if (!(p->flags & BR_MCAST_FLOOD) && skb->dev != br->dev &&
++			    !br_skb_is_mc_query(skb))
+ 				continue;
+ 			if ((p->flags & BR_BPDU_FILTER) &&
+ 			    unlikely(is_link_local_ether_addr(dest) &&
