@@ -12,7 +12,7 @@ MRD_MODEL_OFF=4016       # 0xfb0
 cell() {
 	local f
 	for f in /sys/bus/nvmem/devices/*/cells/$1@*; do
-		[ -r "$f" ] && { tr -d '\0' < "$f"; return 0; }
+		[ -r "$f" ] && { tr -d '\000\377' < "$f"; return 0; }
 	done
 	return 1
 }
@@ -22,11 +22,20 @@ from_mtd() {
 	mtd=$(sed -n 's/^\(mtd[0-9]*\):.*"mrd".*/\1/p' /proc/mtd)
 	[ -n "$mtd" ] || return 1
 	off="$1"; len="$2"
-	dd if="/dev/$mtd" bs=1 skip="$off" count="$len" 2>/dev/null | tr -d '\0'
+	dd if="/dev/$mtd" bs=1 skip="$off" count="$len" 2>/dev/null | tr -d '\000\377'
+}
+
+# A field the factory never programmed holds its placeholder, all 'x' (the
+# hardware version of an XMG1915-10E reads xxxxxxxxxxxxxxx), or erased flash,
+# dropped above: either way it is unset.
+programmed() {
+	case "$1" in
+	*[!x]*) printf '%s' "$1" ;;
+	esac
 }
 
 field() {
-	cell "$1" || from_mtd "$2" "$3"
+	programmed "$(cell "$1" || from_mtd "$2" "$3")"
 }
 
 SERIAL=$(field serial $MRD_SERIAL_OFF 15)
@@ -40,11 +49,16 @@ print)
 	printf 'model:    %s\n' "${MODEL:-unknown}"
 	;;
 cache)
-	# procd reads /tmp/sysinfo at boot; these names sit beside its own.
+	# procd reads /tmp/sysinfo at boot; these names sit beside its own. An
+	# unset field leaves no file, so the status page leaves its row out.
 	mkdir -p /tmp/sysinfo
-	[ -n "$SERIAL" ] && printf '%s\n' "$SERIAL" > /tmp/sysinfo/board_serial
-	[ -n "$HWVER" ]  && printf '%s\n' "$HWVER"  > /tmp/sysinfo/board_hwversion
-	[ -n "$MODEL" ]  && printf '%s\n' "$MODEL"  > /tmp/sysinfo/board_product
+	for f in serial:"$SERIAL" hwversion:"$HWVER" product:"$MODEL"; do
+		if [ -n "${f#*:}" ]; then
+			printf '%s\n' "${f#*:}" > "/tmp/sysinfo/board_${f%%:*}"
+		else
+			rm -f "/tmp/sysinfo/board_${f%%:*}"
+		fi
+	done
 	;;
 *)
 	echo "usage: ${0##*/} {print|cache}" >&2
