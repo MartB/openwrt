@@ -1,0 +1,10 @@
+#!/bin/sh
+# The LED mode and keep_power used to live in /etc/config/poe-led.
+for o in mode keep_power; do
+	v=$(uci -q get poe-led.main.$o) || continue
+	[ "$o" = keep_power ] || [ "$v" != speed ] && uci -q set led-mode.main.$o="$v"
+	uci -q delete poe-led.main.$o
+done
+uci -q commit led-mode
+uci -q commit poe-led
+exit 0

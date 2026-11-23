@@ -1,0 +1,6 @@
+config led-mode 'main'
+	# Front-panel LED mode restored at boot: speed, off, or poe (PoE models)
+	option mode 'speed'
+
+	# Keep the PWR LED lit in 'off' mode, so the unit does not look dead
+	option keep_power '0'

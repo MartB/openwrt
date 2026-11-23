@@ -2,9 +2,9 @@
 # /usr/sbin/led-mode -- what the front-panel LED-mode button does on ZyNOS.
 #
 #   led-mode speed    port LEDs show link speed  (hardware scan engine)
-#   led-mode poe      port LEDs show PoE class   (painted by poe-led)
+#   led-mode poe      port LEDs show PoE class   (painted by poe-led; PoE models)
 #   led-mode off      every front-panel LED dark
-#   led-mode toggle   cycles speed -> poe -> off
+#   led-mode toggle   cycles speed -> poe -> off (speed -> off without PoE)
 #   led-mode release  hand everything back to the switch, keep the saved mode
 #   led-mode status
 #
@@ -32,7 +32,7 @@ LED_CLOUD="${POE_LED_CLOUD:-/sys/class/leds/green:cloud}"
 
 # POE_LED_KEEP_POWER=1 keeps the PWR LED lit in dark mode, so the unit does not
 # look dead.
-KEEP_POWER="${POE_LED_KEEP_POWER:-$(uci -q get poe-led.main.keep_power || echo 0)}"
+KEEP_POWER="${POE_LED_KEEP_POWER:-$(uci -q get led-mode.main.keep_power || echo 0)}"
 LED_PWR_GREEN="/sys/class/leds/green:power"
 LED_PWR_RED="/sys/class/leds/red:power"
 
@@ -49,9 +49,12 @@ power_led() {
 # /var/run/led-mode is what the daemon reads; uci is what survives a reboot.
 # Only written on an actual change, so repeated presses cost no overlay write.
 persist() {
-	[ "$(uci -q get poe-led.main.mode)" = "$1" ] && return 0
-	uci -q set poe-led.main.mode="$1" && uci -q commit poe-led
+	[ "$(uci -q get led-mode.main.mode)" = "$1" ] && return 0
+	uci -q set led-mode.main.mode="$1" && uci -q commit led-mode
 }
+
+# The PoE models have the PoE indicator; only they have a PoE display mode.
+has_poe() { [ -e "$LED_GREEN/brightness" ]; }
 
 indicators_off() {
 	set_led "$LED_BLUE" 0
@@ -247,7 +250,11 @@ status)
 	cat "$STATE" 2>/dev/null || echo speed
 	exit 0
 	;;
-poe|speed|off|toggle|release)
+poe)
+	has_poe || { echo "led-mode: no PoE on this switch" >&2; exit 1; }
+	need_leds || exit 1
+	;;
+speed|off|toggle|release)
 	need_leds || exit 1
 	;;
 *)
@@ -267,9 +274,9 @@ speed)  mode_speed ;;
 off)    mode_off ;;
 release) release ;;
 toggle)
-	# speed -> poe -> off -> speed
+	# speed -> poe -> off -> speed, speed -> off -> speed without PoE
 	case "$(cat "$STATE" 2>/dev/null)" in
-	speed|"") mode_poe ;;
+	speed|"") if has_poe; then mode_poe; else mode_off; fi ;;
 	poe)      mode_off ;;
 	*)        mode_speed ;;
 	esac

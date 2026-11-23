@@ -1,0 +1,21 @@
+#!/bin/sh /etc/rc.common
+# /etc/init.d/led-mode -- the front-panel LED mode chosen before the last
+# reboot. /var/run/led-mode is tmpfs, so the runtime state is "speed" at boot;
+# the persistent copy lives in uci. After poe-led (95), which paints PoE mode.
+
+START=96
+STOP=09
+
+start() {
+	local mode
+
+	mode=$(uci -q get led-mode.main.mode)
+	case "$mode" in
+	poe|off) /usr/sbin/led-mode "$mode" ;;
+	esac
+}
+
+stop() {
+	# hand the LEDs back to the switch; "release" leaves the saved mode alone
+	/usr/sbin/led-mode release
+}

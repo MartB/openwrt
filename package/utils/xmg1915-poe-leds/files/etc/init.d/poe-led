@@ -18,24 +18,10 @@ start_service() {
 	procd_close_instance
 }
 
-# Restore the LED mode chosen before the last reboot. /var/run/led-mode is
-# tmpfs, so the runtime state is always "speed" at boot regardless of what was
-# set; the persistent copy lives in uci.
+# The LED mode (restored at boot, released at stop) is led-mode's own service.
 service_started() {
-	local mode
-
 	# Factory data for anything that wants it; cheap and done once.
 	[ -x /usr/sbin/boardinfo ] && /usr/sbin/boardinfo cache 2>/dev/null
-	mode=$(uci -q get poe-led.main.mode)
-
-	case "$mode" in
-	poe|off) [ -x /usr/sbin/led-mode ] && /usr/sbin/led-mode "$mode" ;;
-	esac
-}
-
-stop_service() {
-	# hand the LEDs back to the switch; "release" leaves the saved mode alone
-	[ -x /usr/sbin/led-mode ] && /usr/sbin/led-mode release
 }
 
 service_triggers() {
