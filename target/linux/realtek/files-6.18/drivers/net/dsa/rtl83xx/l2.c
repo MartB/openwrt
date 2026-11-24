@@ -61,6 +61,8 @@ enum otto_l2_action {
 #define RTL838X_L2_PORT_NEW_SA_FWD(p)		(0x3294 + (((p >> 4) << 2)))
 #define RTL839X_L2_PORT_NEW_SA_FWD(p)		(0x3900 + (((p >> 4) << 2)))
 #define RTL930X_L2_PORT_NEW_SA_FWD(p)		(0x8FF4 + (((p / 10) << 2)))
+#define RTL930X_L2_DYN_PORT_MV_ACT(p)		(0x9000 + (((p / 10) << 2)))
+#define RTL930X_L2_DYN_PORT_MV_LRN		(0x900C)
 #define RTL931X_L2_PORT_NEW_SA_FWD(p)		(0xC830 + (((p / 10) << 2)))
 
 #define RTL838X_L2_PORT_STATIC_MV_ACT(p)	(0x327c + (((p >> 4) << 2)))
@@ -902,12 +904,30 @@ void otto_l2_930x_enable_learning(struct otto_dsa_priv *priv, int port, bool ena
 
 void otto_l2_930x_set_port_new_sa_trap(struct otto_dsa_priv *priv, int port, bool trap)
 {
-	enum otto_l2_action action = trap ? OTTO_L2_ACTION_TRAP2CPU : OTTO_L2_ACTION_FORWARD;
+	/* A locked port: frames from an unknown source address are dropped by
+	 * the chip. Trapping them only made the bridge drop them in software
+	 * (this driver does not offer MAB, so no authenticator takes them), and
+	 * let any host behind the port load the CPU. Whether EAPOL from an
+	 * unknown source still reaches hostapd (802.1X) is untested.
+	 */
+	enum otto_l2_action action = trap ? OTTO_L2_ACTION_DROP : OTTO_L2_ACTION_FORWARD;
 	u32 new_sa_fwd_shift = (port % 10) * 3;
 	u32 val = action << new_sa_fwd_shift;
 
 	regmap_write_bits(priv->map, otto_l2_930x_port_new_sa_fwd(port),
 			  GENMASK(new_sa_fwd_shift + 2, new_sa_fwd_shift), val);
+
+	/* A source address the chip learned on another port that shows up on
+	 * a locked port is a dynamic port move, which by default is forwarded
+	 * and learned again: that would let any MAC active elsewhere through
+	 * the lock. Drop it and do not learn it there. (The SDK does not say
+	 * whether the per-port setting is the new or the old port's; as the
+	 * old port's it changes nothing, since a locked port learns nothing.)
+	 */
+	regmap_write_bits(priv->map, RTL930X_L2_DYN_PORT_MV_ACT(port),
+			  GENMASK(new_sa_fwd_shift + 2, new_sa_fwd_shift),
+			  (trap ? OTTO_L2_ACTION_DROP : OTTO_L2_ACTION_FORWARD) << new_sa_fwd_shift);
+	regmap_write_bits(priv->map, RTL930X_L2_DYN_PORT_MV_LRN, BIT(port), trap ? 0 : BIT(port));
 }
 
 void otto_l2_930x_enable_flood(struct otto_dsa_priv *priv, int port, bool enable)

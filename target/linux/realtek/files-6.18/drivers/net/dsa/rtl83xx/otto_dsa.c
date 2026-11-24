@@ -737,8 +737,8 @@ static int otto_dsa_port_bridge_flags(struct dsa_switch *ds, int port,
 	if (priv->r->enable_flood)
 		priv->r->enable_flood(priv, port, !!(cached_flags & BR_FLOOD));
 
-	/* Trap frames with an unknown source address on a locked port to the
-	 * CPU, so that an authenticator can inspect them and add an FDB entry.
+	/* Frames with an unknown source address on a locked port: dropped by
+	 * the chip on the RTL930x (otto_l2_930x_set_port_new_sa_trap()).
 	 */
 	priv->r->set_l2_new_sa_trap(priv, port, !!(cached_flags & BR_PORT_LOCKED));
 
