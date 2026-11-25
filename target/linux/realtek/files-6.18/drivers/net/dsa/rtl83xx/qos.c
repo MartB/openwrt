@@ -108,8 +108,12 @@ struct otto_qos_trust {
 	u8 sel[2];
 };
 
+/* Trust groups of the RTL930x priority selection; group 0 is the default of every port.
+ * DSCP comes before PCP there: hosts and audio/voice gear mark DSCP, while tagged frames
+ * from other switches or routers often carry PCP 0, which would hide the DSCP.
+ */
 static const struct otto_qos_trust otto_qos_93xx_trust[] = {
-	{ 2, { DCB_APP_SEL_PCP, IEEE_8021QAZ_APP_SEL_DSCP } },
+	{ 2, { IEEE_8021QAZ_APP_SEL_DSCP, DCB_APP_SEL_PCP } },
 	{ 1, { DCB_APP_SEL_PCP } },
 	{ 1, { IEEE_8021QAZ_APP_SEL_DSCP } },
 	{ 0 },
@@ -506,21 +510,20 @@ void otto_qos_839x_init(struct otto_dsa_priv *priv)
 	}
 }
 
-static bool otto_qos_trusts(const struct otto_qos_trust *trust, u8 sel)
-{
-	return memchr(trust->sel, sel, trust->nsel);
-}
-
+/* The first trusted selector gets the highest weight; PCP covers the outer and the inner tag */
 static u32 otto_qos_93xx_trust_weights(const struct otto_qos_trust *trust)
 {
 	u32 v = FIELD_PREP(RTL93XX_PRI_SEL_TBL_CTRL_PORT_MASK, 3);
+	u32 w = 7;
 
-	if (otto_qos_trusts(trust, IEEE_8021QAZ_APP_SEL_DSCP))
-		v |= FIELD_PREP(RTL93XX_PRI_SEL_TBL_CTRL_DSCP_MASK, 5);
-
-	if (otto_qos_trusts(trust, DCB_APP_SEL_PCP))
-		v |= FIELD_PREP(RTL93XX_PRI_SEL_TBL_CTRL_ITAG_MASK, 6) |
-		     FIELD_PREP(RTL93XX_PRI_SEL_TBL_CTRL_OTAG_MASK, 7);
+	for (int i = 0; i < trust->nsel; i++) {
+		if (trust->sel[i] == IEEE_8021QAZ_APP_SEL_DSCP) {
+			v |= FIELD_PREP(RTL93XX_PRI_SEL_TBL_CTRL_DSCP_MASK, w--);
+		} else if (trust->sel[i] == DCB_APP_SEL_PCP) {
+			v |= FIELD_PREP(RTL93XX_PRI_SEL_TBL_CTRL_OTAG_MASK, w--);
+			v |= FIELD_PREP(RTL93XX_PRI_SEL_TBL_CTRL_ITAG_MASK, w--);
+		}
+	}
 
 	return v;
 }
