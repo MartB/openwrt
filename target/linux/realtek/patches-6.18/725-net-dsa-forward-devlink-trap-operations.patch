@@ -1,0 +1,199 @@
+From: Martin Böh <contact@martb.dev>
+Date: Wed, 25 Nov 2026 17:00:00 +0100
+Subject: [PATCH] net: dsa: forward devlink trap operations to switch drivers
+
+DSA owns the devlink instance of a switch and its devlink_ops, so a switch
+driver cannot register packet traps, trap groups and trap policers today.
+Forward the trap, trap group and trap policer operations, and the policer
+drop counter, to new dsa_switch_ops callbacks.
+
+devlink takes the presence of trap_policer_counter_get as support for it
+and fails a policer dump when it returns an error. DSA has the op for every
+switch, so let devlink treat -EOPNOTSUPP from it as "no counter".
+
+Signed-off-by: Martin Böh <contact@martb.dev>
+---
+--- a/include/net/dsa.h
++++ b/include/net/dsa.h
+@@ -1218,6 +1218,39 @@
+ 						   u32 *p_cur, u32 *p_max);
+ 
+ 	/*
++	 * devlink packet traps, trap groups and trap policers. A driver that
++	 * registers traps on ds->devlink must provide at least
++	 * devlink_trap_init and devlink_trap_action_set.
++	 */
++	int	(*devlink_trap_init)(struct dsa_switch *ds,
++				     const struct devlink_trap *trap,
++				     void *trap_ctx);
++	void	(*devlink_trap_fini)(struct dsa_switch *ds,
++				     const struct devlink_trap *trap,
++				     void *trap_ctx);
++	int	(*devlink_trap_action_set)(struct dsa_switch *ds,
++					   const struct devlink_trap *trap,
++					   enum devlink_trap_action action,
++					   struct netlink_ext_ack *extack);
++	int	(*devlink_trap_group_init)(struct dsa_switch *ds,
++					   const struct devlink_trap_group *group);
++	int	(*devlink_trap_group_set)(struct dsa_switch *ds,
++					  const struct devlink_trap_group *group,
++					  const struct devlink_trap_policer *policer,
++					  struct netlink_ext_ack *extack);
++	int	(*devlink_trap_policer_init)(struct dsa_switch *ds,
++					     const struct devlink_trap_policer *policer);
++	void	(*devlink_trap_policer_fini)(struct dsa_switch *ds,
++					     const struct devlink_trap_policer *policer);
++	int	(*devlink_trap_policer_set)(struct dsa_switch *ds,
++					    const struct devlink_trap_policer *policer,
++					    u64 rate, u64 burst,
++					    struct netlink_ext_ack *extack);
++	int	(*devlink_trap_policer_counter_get)(struct dsa_switch *ds,
++						    const struct devlink_trap_policer *policer,
++						    u64 *p_drops);
++
++	/*
+ 	 * MTU change functionality. Switches can also adjust their MRU through
+ 	 * this method. By MTU, one understands the SDU (L2 payload) length.
+ 	 * If the switch needs to account for the DSA tag on the CPU port, this
+--- a/net/dsa/devlink.c
++++ b/net/dsa/devlink.c
+@@ -179,6 +179,111 @@
+ 							p_max);
+ }
+ 
++static int dsa_devlink_trap_init(struct devlink *dl,
++				 const struct devlink_trap *trap,
++				 void *trap_ctx)
++{
++	struct dsa_switch *ds = dsa_devlink_to_ds(dl);
++
++	if (!ds->ops->devlink_trap_init)
++		return -EOPNOTSUPP;
++
++	return ds->ops->devlink_trap_init(ds, trap, trap_ctx);
++}
++
++static void dsa_devlink_trap_fini(struct devlink *dl,
++				  const struct devlink_trap *trap,
++				  void *trap_ctx)
++{
++	struct dsa_switch *ds = dsa_devlink_to_ds(dl);
++
++	if (ds->ops->devlink_trap_fini)
++		ds->ops->devlink_trap_fini(ds, trap, trap_ctx);
++}
++
++static int dsa_devlink_trap_action_set(struct devlink *dl,
++				       const struct devlink_trap *trap,
++				       enum devlink_trap_action action,
++				       struct netlink_ext_ack *extack)
++{
++	struct dsa_switch *ds = dsa_devlink_to_ds(dl);
++
++	if (!ds->ops->devlink_trap_action_set)
++		return -EOPNOTSUPP;
++
++	return ds->ops->devlink_trap_action_set(ds, trap, action, extack);
++}
++
++static int dsa_devlink_trap_group_init(struct devlink *dl,
++				       const struct devlink_trap_group *group)
++{
++	struct dsa_switch *ds = dsa_devlink_to_ds(dl);
++
++	if (!ds->ops->devlink_trap_group_init)
++		return 0;
++
++	return ds->ops->devlink_trap_group_init(ds, group);
++}
++
++static int dsa_devlink_trap_group_set(struct devlink *dl,
++				      const struct devlink_trap_group *group,
++				      const struct devlink_trap_policer *policer,
++				      struct netlink_ext_ack *extack)
++{
++	struct dsa_switch *ds = dsa_devlink_to_ds(dl);
++
++	if (!ds->ops->devlink_trap_group_set)
++		return -EOPNOTSUPP;
++
++	return ds->ops->devlink_trap_group_set(ds, group, policer, extack);
++}
++
++static int dsa_devlink_trap_policer_init(struct devlink *dl,
++					 const struct devlink_trap_policer *policer)
++{
++	struct dsa_switch *ds = dsa_devlink_to_ds(dl);
++
++	if (!ds->ops->devlink_trap_policer_init)
++		return 0;
++
++	return ds->ops->devlink_trap_policer_init(ds, policer);
++}
++
++static void dsa_devlink_trap_policer_fini(struct devlink *dl,
++					  const struct devlink_trap_policer *policer)
++{
++	struct dsa_switch *ds = dsa_devlink_to_ds(dl);
++
++	if (ds->ops->devlink_trap_policer_fini)
++		ds->ops->devlink_trap_policer_fini(ds, policer);
++}
++
++static int dsa_devlink_trap_policer_set(struct devlink *dl,
++					const struct devlink_trap_policer *policer,
++					u64 rate, u64 burst,
++					struct netlink_ext_ack *extack)
++{
++	struct dsa_switch *ds = dsa_devlink_to_ds(dl);
++
++	if (!ds->ops->devlink_trap_policer_set)
++		return -EOPNOTSUPP;
++
++	return ds->ops->devlink_trap_policer_set(ds, policer, rate, burst,
++						 extack);
++}
++
++static int dsa_devlink_trap_policer_counter_get(struct devlink *dl,
++						const struct devlink_trap_policer *policer,
++						u64 *p_drops)
++{
++	struct dsa_switch *ds = dsa_devlink_to_ds(dl);
++
++	if (!ds->ops->devlink_trap_policer_counter_get)
++		return -EOPNOTSUPP;
++
++	return ds->ops->devlink_trap_policer_counter_get(ds, policer, p_drops);
++}
++
+ static const struct devlink_ops dsa_devlink_ops = {
+ 	.info_get			= dsa_devlink_info_get,
+ 	.flash_update			= dsa_devlink_flash_update,
+@@ -192,6 +297,15 @@
+ 	.sb_occ_max_clear		= dsa_devlink_sb_occ_max_clear,
+ 	.sb_occ_port_pool_get		= dsa_devlink_sb_occ_port_pool_get,
+ 	.sb_occ_tc_port_bind_get	= dsa_devlink_sb_occ_tc_port_bind_get,
++	.trap_init			= dsa_devlink_trap_init,
++	.trap_fini			= dsa_devlink_trap_fini,
++	.trap_action_set		= dsa_devlink_trap_action_set,
++	.trap_group_init		= dsa_devlink_trap_group_init,
++	.trap_group_set			= dsa_devlink_trap_group_set,
++	.trap_policer_init		= dsa_devlink_trap_policer_init,
++	.trap_policer_fini		= dsa_devlink_trap_policer_fini,
++	.trap_policer_set		= dsa_devlink_trap_policer_set,
++	.trap_policer_counter_get	= dsa_devlink_trap_policer_counter_get,
+ };
+ 
+ int dsa_devlink_param_get(struct devlink *dl, u32 id,
+--- a/net/devlink/trap.c
++++ b/net/devlink/trap.c
+@@ -738,6 +738,9 @@
+ 		return 0;
+ 
+ 	err = devlink->ops->trap_policer_counter_get(devlink, policer, &drops);
++	/* A forwarding layer (DSA) always has the op, the device may not */
++	if (err == -EOPNOTSUPP)
++		return 0;
+ 	if (err)
+ 		return err;
+ 
