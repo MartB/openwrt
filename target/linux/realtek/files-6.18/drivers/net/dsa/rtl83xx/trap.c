@@ -19,15 +19,24 @@
  *
  * The ethernet driver serves one receive ring per CPU queue and calls
  * otto_trap_rx() for every frame, which counts it against its trap.
+ *
+ * Most traps take frames the CPU needs from the switch's forwarding (STP,
+ * LACP, IGMP snooping, ...). IPv6 neighbour discovery and DHCP are mirrored
+ * instead: the switch forwards them as before and copies them to the CPU,
+ * into a queue of their own, so that the switch's own neighbour resolution
+ * and DHCP keep working while a flood fills the flood queue.
  */
 
 #include <linux/bitfield.h>
+#include <linux/if_vlan.h>
 #include <linux/hrtimer.h>
 #include <linux/regmap.h>
 #include <linux/soc/realtek/otto_eth.h>
 #include <linux/spinlock.h>
+#include <linux/unaligned.h>
 #include <net/devlink.h>
 #include <net/dsa.h>
+#include <net/ndisc.h>
 
 #include "otto_dsa.h"
 #include "trap.h"
@@ -56,6 +65,25 @@
 #define RTL930X_STAT_CPU_Q_DROP			GENMASK(15, 0)
 #define OTTO_TRAP_DROP_POLL_NS			(5 * NSEC_PER_MSEC)
 
+/*
+ * Copy to the CPU for DHCP (VLAN_APP_PKT_CTRL, in every VLAN whose group
+ * mask selects the application, which the driver sets for all of them) and
+ * for IPv6 neighbour discovery (IP6_ND_ACT of VLAN profile 0, word 1, which
+ * every VLAN uses). Copying leaves forwarding to the switch.
+ *
+ * The ARP actions of VLAN_APP_PKT_CTRL do nothing with IPv4 routing enabled
+ * in the VLAN profile (tested: neither copy nor trap changes the reason).
+ * ARP for the switch's own addresses hits the L3 host route trap instead and
+ * counts as local_route, in the local delivery queue.
+ */
+#define RTL930X_VLAN_APP_PKT_CTRL		0xa23c
+#define RTL930X_APP_DHCP6_ACT			GENMASK(11, 9)
+#define RTL930X_APP_DHCP_ACT			GENMASK(8, 6)
+#define RTL930X_APP_ACT_COPY2CPU		2
+#define RTL930X_VLAN_PROFILE0_W1		(0x9c60 + 4)
+#define RTL930X_VLAN_PROFILE_IP6_ND_ACT		GENMASK(11, 9)
+#define RTL930X_VLAN_ACT_COPY2CPU		3
+
 #define OTTO_TRAP_CPU_QUEUES			8	/* queue 0 + one per policer */
 #define OTTO_TRAP_POLICERS			(OTTO_TRAP_CPU_QUEUES - 1)
 #define OTTO_TRAP_REASONS			64	/* 6-bit CPU tag reason */
@@ -66,9 +94,22 @@ enum {
 	OTTO_TRAP_POLICER_LOCAL_DELIVERY,
 	OTTO_TRAP_POLICER_L3_EXCEPTIONS,
 	OTTO_TRAP_POLICER_FLOOD,
-	OTTO_TRAP_POLICER_SPARE1,
-	OTTO_TRAP_POLICER_SPARE2,
+	OTTO_TRAP_POLICER_NEIGH_DISCOVERY,
+	OTTO_TRAP_POLICER_DHCP,
 };
+
+/* Traps that share a CPU tag reason, told apart by the frame */
+enum {
+	OTTO_TRAP_SUB_NONE,
+	OTTO_TRAP_SUB_NEIGH_SOLICIT,
+	OTTO_TRAP_SUB_NEIGH_ADVERT,
+	OTTO_TRAP_SUB_IPV4_DHCP,
+	OTTO_TRAP_SUB_IPV6_DHCP,
+	OTTO_TRAP_SUBS,
+};
+
+#define OTTO_TRAP_REASON_DHCP			56
+#define OTTO_TRAP_REASON_ND			58
 
 enum {
 	OTTO_TRAP_GROUP_L2_FLOOD = DEVLINK_TRAP_GROUP_GENERIC_ID_MAX + 1,
@@ -91,12 +132,16 @@ struct otto_trap_info {
 	u8 n_fields;
 	const u8 *reasons;
 	u8 n_reasons;
+	u8 sub;				/* OTTO_TRAP_SUB_*, for traps sharing a reason */
+	u32 app_act;			/* VLAN_APP_PKT_CTRL field to set to copy */
+	bool nd_act;			/* VLAN profile IP6_ND_ACT to set to copy */
 };
 
 struct otto_trap_ctrl {
 	struct otto_dsa_priv *priv;
 	struct net_device *conduit;
 	void *reason_ctx[OTTO_TRAP_REASONS];
+	void *sub_ctx[OTTO_TRAP_SUBS];
 	struct devlink_port *dl_port[57];
 	bool registered;
 
@@ -142,6 +187,8 @@ static const struct otto_trap_field l3_exception_fields[] = {
 	FIELD_AT(6, 5),		/* IPMC_TTL */
 };
 static const struct otto_trap_field flood_fields[] = { FIELD_AT(8, 0) };	/* NORMAL_FWD */
+static const struct otto_trap_field nd_fields[] = { FIELD_AT(7, 15) };		/* NEIGHBOR_DISCOVER */
+static const struct otto_trap_field dhcp_fields[] = { FIELD_AT(7, 25) };	/* DHCP_DHCP6 */
 
 /* CPU tag reasons (Realtek SDK nic_rtl9300.c reasonTbl) */
 static const u8 stp_reasons[] = { 24 };
@@ -164,6 +211,16 @@ static const u8 flood_reasons[] = { 63 };
 		.n_reasons = ARRAY_SIZE(_name##_reasons),		\
 	}
 
+#define TRAP_INFO_COPY(_id, _name, _sub, _app_act, _nd_act)		\
+	{								\
+		.id = (_id),						\
+		.fields = _name##_fields,				\
+		.n_fields = ARRAY_SIZE(_name##_fields),			\
+		.sub = (_sub),						\
+		.app_act = (_app_act),					\
+		.nd_act = (_nd_act),					\
+	}
+
 static const struct otto_trap_info otto_trap_infos[] = {
 	TRAP_INFO(DEVLINK_TRAP_GENERIC_ID_STP, stp),
 	TRAP_INFO(DEVLINK_TRAP_GENERIC_ID_LACP, lacp),
@@ -173,10 +230,24 @@ static const struct otto_trap_info otto_trap_infos[] = {
 	TRAP_INFO(DEVLINK_TRAP_GENERIC_ID_LOCAL_ROUTE, local_route),
 	TRAP_INFO(OTTO_TRAP_ID_L3_EXCEPTION, l3_exception),
 	TRAP_INFO(OTTO_TRAP_ID_FLOOD_TO_CPU, flood),
+	TRAP_INFO_COPY(DEVLINK_TRAP_GENERIC_ID_IPV6_NEIGH_SOLICIT, nd,
+		       OTTO_TRAP_SUB_NEIGH_SOLICIT, 0, true),
+	TRAP_INFO_COPY(DEVLINK_TRAP_GENERIC_ID_IPV6_NEIGH_ADVERT, nd,
+		       OTTO_TRAP_SUB_NEIGH_ADVERT, 0, true),
+	TRAP_INFO_COPY(DEVLINK_TRAP_GENERIC_ID_IPV4_DHCP, dhcp,
+		       OTTO_TRAP_SUB_IPV4_DHCP, RTL930X_APP_DHCP_ACT, false),
+	TRAP_INFO_COPY(DEVLINK_TRAP_GENERIC_ID_IPV6_DHCP, dhcp,
+		       OTTO_TRAP_SUB_IPV6_DHCP, RTL930X_APP_DHCP6_ACT, false),
 };
 
 #define OTTO_TRAP_CONTROL(_id, _group)					\
 	DEVLINK_TRAP_GENERIC(CONTROL, TRAP, _id,			\
+			     DEVLINK_TRAP_GROUP_GENERIC_ID_##_group,	\
+			     DEVLINK_TRAP_METADATA_TYPE_F_IN_PORT)
+
+/* Copied to the CPU and forwarded by the switch as well: devlink's mirror */
+#define OTTO_TRAP_MIRROR(_id, _group)					\
+	DEVLINK_TRAP_GENERIC(CONTROL, MIRROR, _id,			\
 			     DEVLINK_TRAP_GROUP_GENERIC_ID_##_group,	\
 			     DEVLINK_TRAP_METADATA_TYPE_F_IN_PORT)
 
@@ -195,6 +266,10 @@ static const struct devlink_trap otto_traps[] = {
 	DEVLINK_TRAP_DRIVER(CONTROL, TRAP, OTTO_TRAP_ID_FLOOD_TO_CPU, "flood_to_cpu",
 			    OTTO_TRAP_GROUP_L2_FLOOD,
 			    DEVLINK_TRAP_METADATA_TYPE_F_IN_PORT),
+	OTTO_TRAP_MIRROR(IPV6_NEIGH_SOLICIT, NEIGH_DISCOVERY),
+	OTTO_TRAP_MIRROR(IPV6_NEIGH_ADVERT, NEIGH_DISCOVERY),
+	OTTO_TRAP_MIRROR(IPV4_DHCP, DHCP),
+	OTTO_TRAP_MIRROR(IPV6_DHCP, DHCP),
 };
 
 static const struct devlink_trap_group otto_trap_groups[] = {
@@ -205,6 +280,8 @@ static const struct devlink_trap_group otto_trap_groups[] = {
 	DEVLINK_TRAP_GROUP_GENERIC(MC_SNOOPING, OTTO_TRAP_POLICER_MC_SNOOPING),
 	DEVLINK_TRAP_GROUP_GENERIC(LOCAL_DELIVERY, OTTO_TRAP_POLICER_LOCAL_DELIVERY),
 	DEVLINK_TRAP_GROUP_GENERIC(L3_EXCEPTIONS, OTTO_TRAP_POLICER_L3_EXCEPTIONS),
+	DEVLINK_TRAP_GROUP_GENERIC(NEIGH_DISCOVERY, OTTO_TRAP_POLICER_NEIGH_DISCOVERY),
+	DEVLINK_TRAP_GROUP_GENERIC(DHCP, OTTO_TRAP_POLICER_DHCP),
 	{
 		.name = "l2_flood",
 		.id = OTTO_TRAP_GROUP_L2_FLOOD,
@@ -230,8 +307,8 @@ static const struct devlink_trap_policer otto_trap_policers[] = {
 	OTTO_TRAP_POLICER(OTTO_TRAP_POLICER_LOCAL_DELIVERY, 4000, 512),
 	OTTO_TRAP_POLICER(OTTO_TRAP_POLICER_L3_EXCEPTIONS, 1000, 256),
 	OTTO_TRAP_POLICER(OTTO_TRAP_POLICER_FLOOD, 2000, 512),
-	OTTO_TRAP_POLICER(OTTO_TRAP_POLICER_SPARE1, 1000, 256),
-	OTTO_TRAP_POLICER(OTTO_TRAP_POLICER_SPARE2, 1000, 256),
+	OTTO_TRAP_POLICER(OTTO_TRAP_POLICER_NEIGH_DISCOVERY, 1024, 256),
+	OTTO_TRAP_POLICER(OTTO_TRAP_POLICER_DHCP, 512, 128),
 };
 
 static_assert(ARRAY_SIZE(otto_trap_policers) == OTTO_TRAP_POLICERS);
@@ -348,6 +425,61 @@ int otto_trap_policer_counter_get(struct dsa_switch *ds,
 	return 0;
 }
 
+/* Offset of the L3 header and its ethertype, past up to two VLAN tags */
+static int otto_trap_l3(const struct sk_buff *skb, u16 *proto)
+{
+	unsigned int off = ETH_HLEN;
+	u16 p;
+
+	if (skb_headlen(skb) < ETH_HLEN)
+		return -1;
+
+	p = get_unaligned_be16(skb->data + 12);
+	for (int i = 0; i < 2 && (p == ETH_P_8021Q || p == ETH_P_8021AD); i++) {
+		if (skb_headlen(skb) < off + VLAN_HLEN)
+			return -1;
+		p = get_unaligned_be16(skb->data + off + 2);
+		off += VLAN_HLEN;
+	}
+	*proto = p;
+
+	return off;
+}
+
+/* Which of the traps that share @reason the frame belongs to */
+static int otto_trap_sub(const struct sk_buff *skb, int reason)
+{
+	int off;
+	u16 p;
+
+	off = otto_trap_l3(skb, &p);
+	if (off < 0)
+		return OTTO_TRAP_SUB_NONE;
+
+	switch (reason) {
+	case OTTO_TRAP_REASON_DHCP:
+		if (p == ETH_P_IP)
+			return OTTO_TRAP_SUB_IPV4_DHCP;
+		if (p == ETH_P_IPV6)
+			return OTTO_TRAP_SUB_IPV6_DHCP;
+		break;
+	case OTTO_TRAP_REASON_ND:
+		/* NS and NA carry no extension headers in front of ICMPv6 */
+		if (p != ETH_P_IPV6 || skb_headlen(skb) < off + 41 ||
+		    skb->data[off + 6] != IPPROTO_ICMPV6)
+			break;
+		switch (skb->data[off + 40]) {
+		case NDISC_NEIGHBOUR_SOLICITATION:
+			return OTTO_TRAP_SUB_NEIGH_SOLICIT;
+		case NDISC_NEIGHBOUR_ADVERTISEMENT:
+			return OTTO_TRAP_SUB_NEIGH_ADVERT;
+		}
+		break;
+	}
+
+	return OTTO_TRAP_SUB_NONE;
+}
+
 static void otto_trap_rx(void *ctx, struct sk_buff *skb, int port, int reason)
 {
 	struct otto_trap_ctrl *ctrl = ctx;
@@ -356,13 +488,33 @@ static void otto_trap_rx(void *ctx, struct sk_buff *skb, int port, int reason)
 	if (unlikely(reason < 0 || reason >= OTTO_TRAP_REASONS))
 		return;
 
-	trap_ctx = READ_ONCE(ctrl->reason_ctx[reason]);
+	if (reason >= OTTO_TRAP_REASON_DHCP && reason <= OTTO_TRAP_REASON_ND)
+		trap_ctx = READ_ONCE(ctrl->sub_ctx[otto_trap_sub(skb, reason)]);
+	else
+		trap_ctx = READ_ONCE(ctrl->reason_ctx[reason]);
 	if (!trap_ctx)
 		return;
 
 	devlink_trap_report(ctrl->priv->ds->devlink, skb, trap_ctx,
 			    port < ARRAY_SIZE(ctrl->dl_port) ? ctrl->dl_port[port] : NULL,
 			    NULL);
+}
+
+/* Have the switch copy the frames of a mirror trap to the CPU, or stop it */
+static void otto_trap_copy_set(struct otto_dsa_priv *priv, const struct otto_trap_info *info,
+			       bool copy)
+{
+	if (info->app_act)
+		regmap_update_bits(priv->map, RTL930X_VLAN_APP_PKT_CTRL, info->app_act,
+				   copy ? (RTL930X_APP_ACT_COPY2CPU << __ffs(info->app_act)) & info->app_act
+					: 0);
+
+	/* IP6_ND_ACT covers solicitations and advertisements alike */
+	if (info->nd_act)
+		regmap_update_bits(priv->map, RTL930X_VLAN_PROFILE0_W1,
+				   RTL930X_VLAN_PROFILE_IP6_ND_ACT,
+				   copy ? FIELD_PREP(RTL930X_VLAN_PROFILE_IP6_ND_ACT,
+						     RTL930X_VLAN_ACT_COPY2CPU) : 0);
 }
 
 int otto_trap_init(struct dsa_switch *ds, const struct devlink_trap *trap, void *trap_ctx)
@@ -379,6 +531,10 @@ int otto_trap_init(struct dsa_switch *ds, const struct devlink_trap *trap, void 
 
 	for (int i = 0; i < info->n_reasons; i++)
 		WRITE_ONCE(priv->trap_ctrl->reason_ctx[info->reasons[i]], trap_ctx);
+	if (info->sub)
+		WRITE_ONCE(priv->trap_ctrl->sub_ctx[info->sub], trap_ctx);
+
+	otto_trap_copy_set(priv, info, true);
 
 	return 0;
 }
@@ -395,20 +551,25 @@ void otto_trap_fini(struct dsa_switch *ds, const struct devlink_trap *trap, void
 	if (!info)
 		return;
 
+	otto_trap_copy_set(priv, info, false);
+
 	for (int i = 0; i < info->n_reasons; i++)
 		WRITE_ONCE(priv->trap_ctrl->reason_ctx[info->reasons[i]], NULL);
+	if (info->sub)
+		WRITE_ONCE(priv->trap_ctrl->sub_ctx[info->sub], NULL);
 }
 
 int otto_trap_action_set(struct dsa_switch *ds, const struct devlink_trap *trap,
 			 enum devlink_trap_action action, struct netlink_ext_ack *extack)
 {
 	/*
-	 * The switch keeps trapping these frames: STP, LACP and IGMP snooping
-	 * run on the CPU, and the CPU port is part of every flood domain.
-	 * Mirroring (forward and copy) is not offered.
+	 * Every trap keeps the action it was registered with. Trapped frames
+	 * (STP, LACP, IGMP snooping, ...) are needed by the CPU; mirrored ones
+	 * (ND, DHCP) must go on being forwarded by the switch, as the
+	 * stack does not forward frames the switch has already forwarded.
 	 */
-	if (action != DEVLINK_TRAP_ACTION_TRAP) {
-		NL_SET_ERR_MSG_MOD(extack, "Only the trap action is supported");
+	if (action != trap->init_action) {
+		NL_SET_ERR_MSG_MOD(extack, "The action of this trap cannot be changed");
 		return -EOPNOTSUPP;
 	}
 

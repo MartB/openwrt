@@ -587,6 +587,12 @@ void otto_vlan_930x_tables_read(u32 vlan, struct otto_vlan_info *info)
 
 /* Group mask bits for the IGMP and MLD actions of VLAN_APP_PKT_CTRL */
 #define RTLDSA_93XX_VLAN_GROUP_IGMP_MLD	(BIT(2) | BIT(3))
+/*
+ * RTL930x: bits 0-5 select the application packets of VLAN_APP_PKT_CTRL
+ * (IGMP, MLD, DHCP, DHCPv6, ARP request and reply in the SDK's list). Its
+ * actions decide what happens to them, forwarding unless set otherwise.
+ */
+#define RTLDSA_930X_VLAN_GROUP_APP_PKT	GENMASK(5, 0)
 
 void otto_vlan_930x_set_tagged(u32 vlan, struct otto_vlan_info *info)
 {
@@ -600,7 +606,7 @@ void otto_vlan_930x_set_tagged(u32 vlan, struct otto_vlan_info *info)
 	w |= info->hash_mc_fid ? BIT(27) : 0;
 	w |= info->hash_uc_fid ? BIT(28) : 0;
 	w |= info->profile_id << 24;
-	w |= RTLDSA_93XX_VLAN_GROUP_IGMP_MLD << 16;
+	w |= RTLDSA_930X_VLAN_GROUP_APP_PKT << 16;
 
 	buf[0] = v;
 	buf[1] = w;

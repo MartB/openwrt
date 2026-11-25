@@ -686,7 +686,7 @@ static void rteth_930x_hw_init(struct rteth_ctrl *ctrl)
 	/* Trap IGMP and MLD to the CPU (IGMP_ACT = MLD_ACT = 1) in every VLAN
 	 * whose group mask selects them
 	 */
-	regmap_write(ctrl->map, RTETH_930X_VLAN_APP_PKT_CTRL, 0x9);
+	regmap_update_bits(ctrl->map, RTETH_930X_VLAN_APP_PKT_CTRL, GENMASK(5, 0), 0x9);
 	/* Flush learned FDB entries on link down of a port */
 	regmap_set_bits(ctrl->map, RTETH_930X_L2_CTRL, BIT(7));
 
