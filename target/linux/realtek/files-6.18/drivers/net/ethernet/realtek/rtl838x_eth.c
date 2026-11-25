@@ -159,7 +159,7 @@ static void rteth_disable_all_irqs(struct rteth_ctrl *ctrl)
 
 static void rteth_enable_all_rx_irqs(struct rteth_ctrl *ctrl)
 {
-	for (int ring = 0; ring < RTETH_RX_RINGS; ring++)
+	for (int ring = 0; ring < ctrl->cfg->rx_rings_used; ring++)
 		ctrl->cfg->enable_rx_irq(ctrl, ring);
 }
 
@@ -241,7 +241,7 @@ static irqreturn_t rteth_net_irq(int irq, void *dev_id)
 	unsigned long ring, rings;
 
 	ctrl->cfg->confirm_disable_irqs(ctrl, &rings);
-	for_each_set_bit(ring, &rings, RTETH_RX_RINGS) {
+	for_each_set_bit(ring, &rings, ctrl->cfg->rx_rings_used) {
 		netdev_dbg(dev, "schedule rx ring %lu\n", ring);
 		napi_schedule(&ctrl->rx_info[ring].napi);
 	}
@@ -302,7 +302,7 @@ static void rteth_93xx_set_hol(struct rteth_ctrl *ctrl)
 	int frags_per_pkt = DIV_ROUND_UP(max_frame_size, RTETH_SKB_FRAG_SIZE);
 	int cnt = min(RTETH_RX_RING_SIZE / frags_per_pkt, 0x3ff);
 
-	for (int ring = 0; ring < RTETH_RX_RINGS; ring++) {
+	for (int ring = 0; ring < ctrl->cfg->rx_rings_used; ring++) {
 		int shift = (ring % 3) * 10;
 		int reg = (ring / 3) * 4;
 
@@ -315,7 +315,7 @@ static void rteth_93xx_hw_reset(struct rteth_ctrl *ctrl)
 {
 	rteth_nic_reset(ctrl, 0x6);
 
-	for (int ring = 0; ring < RTETH_RX_RINGS; ring++) {
+	for (int ring = 0; ring < ctrl->cfg->rx_rings_used; ring++) {
 		int reg = (ring / 3) * 4;
 		u32 v;
 
@@ -344,14 +344,15 @@ static void rteth_setup_cpu_rx_rings(struct rteth_ctrl *ctrl)
 	if (ctrl->cfg->qm_pkt2cpu_intpri_map) {
 		for (int priority = 0; priority < 8; priority++) {
 			int reg = ctrl->cfg->qm_pkt2cpu_intpri_map;
-			int ring = priority % RTETH_RX_RINGS;
+			int ring = priority % ctrl->cfg->rx_rings_used;
 			int shift = priority * 3;
 
 			regmap_update_bits(ctrl->map, reg, 0x7 << shift, ring << shift);
 		}
 	}
 
-	if (ctrl->cfg->qm_rsn2cpuqid_ctrl) {
+	/* With a switch driver hook installed the switch driver owns this mapping */
+	if (ctrl->cfg->qm_rsn2cpuqid_ctrl && !READ_ONCE(ctrl->rx_hook)) {
 		int mask, bits_per_field, fields_per_reg, reason_cnt;
 
 		mask = ctrl->cfg->rx_rings - 1;
@@ -363,7 +364,7 @@ static void rteth_setup_cpu_rx_rings(struct rteth_ctrl *ctrl)
 		for (int reason = 0; reason < reason_cnt; reason++) {
 			int reg = ctrl->cfg->qm_rsn2cpuqid_ctrl + 4 * (reason / fields_per_reg);
 			int shift = (reason % fields_per_reg) * bits_per_field;
-			int ring = reason % RTETH_RX_RINGS;
+			int ring = reason % ctrl->cfg->rx_rings_used;
 
 			regmap_update_bits(ctrl->map, reg, mask << shift, ring << shift);
 		}
@@ -372,7 +373,7 @@ static void rteth_setup_cpu_rx_rings(struct rteth_ctrl *ctrl)
 
 static void rteth_hw_ring_setup(struct rteth_ctrl *ctrl)
 {
-	for (int r = 0; r < RTETH_RX_RINGS; r++)
+	for (int r = 0; r < ctrl->cfg->rx_rings_used; r++)
 		regmap_write(ctrl->map, ctrl->cfg->dma_rx_base + r * 4,
 			     ctrl->rx_dma + r * sizeof(struct rteth_rx_data) +
 			     offsetof(struct rteth_rx_data, ring));
@@ -578,7 +579,7 @@ static void rteth_free_rx_buffers(struct rteth_ctrl *ctrl)
 {
 	struct rteth_rx_info *rx_info;
 
-	for (int r = 0; r < RTETH_RX_RINGS; r++) {
+	for (int r = 0; r < ctrl->cfg->rx_rings_used; r++) {
 		rx_info = &ctrl->rx_info[r];
 		for (int i = 0; i < RTETH_RX_RING_SIZE; i++) {
 			if (!rx_info->page[i])
@@ -607,7 +608,7 @@ static int rteth_setup_ring_buffer(struct rteth_ctrl *ctrl)
 	BUILD_BUG_ON(RTETH_SKB_HEADROOM_FAST + RTETH_SKB_FRAG_SIZE +
 		     SKB_DATA_ALIGN(sizeof(struct skb_shared_info)) > RTETH_PPOOL_FRAG_SIZE);
 
-	for (int r = 0; r < RTETH_RX_RINGS; r++) {
+	for (int r = 0; r < ctrl->cfg->rx_rings_used; r++) {
 		for (int i = 0; i < RTETH_RX_RING_SIZE; i++) {
 			frag = &ctrl->rx_data[r].frag[i];
 			page = page_pool_dev_alloc_frag(ctrl->rx_info[r].pool,
@@ -714,7 +715,7 @@ static void rteth_931x_hw_init(struct rteth_ctrl *ctrl)
 
 static void rteth_enable_napi(struct rteth_ctrl *ctrl)
 {
-	for (int i = 0; i < RTETH_RX_RINGS; i++)
+	for (int i = 0; i < ctrl->cfg->rx_rings_used; i++)
 		napi_enable(&ctrl->rx_info[i].napi);
 	ctrl->napi_enabled = true;
 }
@@ -725,7 +726,7 @@ static void rteth_disable_napi(struct rteth_ctrl *ctrl)
 		return;
 
 	ctrl->napi_enabled = false;
-	for (int i = 0; i < RTETH_RX_RINGS; i++)
+	for (int i = 0; i < ctrl->cfg->rx_rings_used; i++)
 		napi_disable(&ctrl->rx_info[i].napi);
 }
 
@@ -1152,8 +1153,12 @@ static struct sk_buff *rteth_create_skb(struct rteth_ctrl *ctrl, int ring, int s
 
 	ctrl->cfg->decode_tag(frag, &tag);
 	if (netdev_uses_dsa(dev) && tag.port < ctrl->cfg->cpu_port) {
+		otto_eth_rx_hook_t hook = READ_ONCE(ctrl->rx_hook);
+
 		md_dst = tag.l2_offloaded ? ctrl->dsa_meta[tag.port] : ctrl->dsa_meta_trapped[tag.port];
 		skb_dst_set_noref(skb, &md_dst->dst);
+		if (hook)
+			hook(READ_ONCE(ctrl->rx_hook_ctx), skb, tag.port, tag.reason);
 	}
 
 	if (dev->features & NETIF_F_RXCSUM) {
@@ -1500,10 +1505,51 @@ static const struct net_device_ops rteth_netdev_ops = {
 	.ndo_setup_tc		= rteth_setup_tc,
 };
 
+static struct rteth_ctrl *rteth_ctrl_of(struct net_device *dev)
+{
+	if (!dev || dev->netdev_ops != &rteth_netdev_ops)
+		return NULL;
+
+	return netdev_priv(dev);
+}
+
+int otto_eth_set_rx_hook(struct net_device *dev, otto_eth_rx_hook_t hook, void *ctx)
+{
+	struct rteth_ctrl *ctrl = rteth_ctrl_of(dev);
+
+	if (!ctrl)
+		return -ENODEV;
+
+	if (hook) {
+		if (ctrl->rx_hook && ctrl->rx_hook != hook)
+			return -EBUSY;
+
+		WRITE_ONCE(ctrl->rx_hook_ctx, ctx);
+		smp_wmb();
+		WRITE_ONCE(ctrl->rx_hook, hook);
+	} else {
+		WRITE_ONCE(ctrl->rx_hook, NULL);
+		synchronize_net();
+		WRITE_ONCE(ctrl->rx_hook_ctx, NULL);
+	}
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(otto_eth_set_rx_hook);
+
+int otto_eth_rx_queues(struct net_device *dev)
+{
+	struct rteth_ctrl *ctrl = rteth_ctrl_of(dev);
+
+	return ctrl ? ctrl->cfg->rx_rings_used : 0;
+}
+EXPORT_SYMBOL_GPL(otto_eth_rx_queues);
+
 static const struct rteth_cfg rteth_838x_cfg = {
 	.cpu_port		= RTETH_838X_CPU_PORT,
 	.max_mtu		= RTETH_838X_MAX_FRAME - RTETH_FRAME_OVERHEAD,
 	.rx_rings		= 8,
+	.rx_rings_used		= 2,
 	.tx_rx_enable		= 0xc,
 	.tx_trigger_mask	= BIT(1),
 	.mac_l2_port_ctrl	= RTETH_838X_MAC_L2_PORT_CTRL,
@@ -1543,6 +1589,7 @@ static const struct rteth_cfg rteth_839x_cfg = {
 	.cpu_port		= RTETH_839X_CPU_PORT,
 	.max_mtu		= RTETH_839X_MAX_FRAME - RTETH_FRAME_OVERHEAD,
 	.rx_rings		= 8,
+	.rx_rings_used		= 2,
 	.tx_rx_enable		= 0xc,
 	.tx_trigger_mask	= BIT(1),
 	.mac_l2_port_ctrl	= RTETH_839X_MAC_L2_PORT_CTRL,
@@ -1580,6 +1627,8 @@ static const struct rteth_cfg rteth_930x_cfg = {
 	.cpu_port		= RTETH_930X_CPU_PORT,
 	.max_mtu		= RTETH_930X_MAX_FRAME - RTETH_FRAME_OVERHEAD,
 	.rx_rings		= 32,
+	.rx_rings_used		= 2,
+	.rx_rings_used		= RTETH_RX_RINGS,
 	.tx_rx_enable		= 0x30,
 	.tx_trigger_mask	= GENMASK(3, 2),
 	.mac_l2_port_ctrl	= RTETH_930X_MAC_L2_PORT_CTRL,
@@ -1811,7 +1860,7 @@ static int rteth_probe(struct platform_device *pdev)
 	dev_info(&pdev->dev, "Using MAC %pM\n", dev->dev_addr);
 	strscpy(dev->name, "eth%d", sizeof(dev->name));
 
-	for (int i = 0; i < RTETH_RX_RINGS; i++) {
+	for (int i = 0; i < ctrl->cfg->rx_rings_used; i++) {
 		ctrl->rx_info[i].id = i;
 		ctrl->rx_info[i].ctrl = ctrl;
 		netif_napi_add(dev, &ctrl->rx_info[i].napi, rteth_poll_rx);
@@ -1842,7 +1891,7 @@ static int rteth_probe(struct platform_device *pdev)
 		goto cleanup;
 	}
 
-	for (int i = 0; i < RTETH_RX_RINGS; i++) {
+	for (int i = 0; i < ctrl->cfg->rx_rings_used; i++) {
 		pp_params.napi = &ctrl->rx_info[i].napi;
 		ctrl->rx_info[i].pool = page_pool_create(&pp_params);
 		if (IS_ERR(ctrl->rx_info[i].pool)) {
@@ -1867,7 +1916,7 @@ cleanup:
 	rteth_metadata_dst_free(ctrl);
 	if (ctrl->phylink)
 		phylink_destroy(ctrl->phylink);
-	for (int i = 0; i < RTETH_RX_RINGS; i++) {
+	for (int i = 0; i < ctrl->cfg->rx_rings_used; i++) {
 		netif_napi_del(&ctrl->rx_info[i].napi);
 		if (ctrl->rx_info[i].pool)
 			page_pool_destroy(ctrl->rx_info[i].pool);
@@ -1889,7 +1938,7 @@ static void rteth_remove(struct platform_device *pdev)
 	if (ctrl->phylink)
 		phylink_destroy(ctrl->phylink);
 
-	for (int i = 0; i < RTETH_RX_RINGS; i++) {
+	for (int i = 0; i < ctrl->cfg->rx_rings_used; i++) {
 		netif_napi_del(&ctrl->rx_info[i].napi);
 		if (ctrl->rx_info[i].pool)
 			page_pool_destroy(ctrl->rx_info[i].pool);

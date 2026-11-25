@@ -3,6 +3,8 @@
 #ifndef _RTL838X_ETH_H
 #define _RTL838X_ETH_H
 
+#include <linux/soc/realtek/otto_eth.h>
+
 #define RTETH_MAX_MAC_REGS			3
 
 /* Register definition */
@@ -203,7 +205,8 @@
 #define RTETH_RING_WRAP				BIT(1)
 
 #define RTETH_RX_RING_SIZE			128
-#define RTETH_RX_RINGS				2
+/* Receive rings a family may use (rteth_cfg.rx_rings_used), one per CPU queue */
+#define RTETH_RX_RINGS				8
 #define RTETH_TX_RING_SIZE			16
 #define RTETH_TX_RINGS				2
 #define RTETH_TX_TRIGGER(ctrl, ring)		((0x16 >> ring) & ctrl->cfg->tx_trigger_mask)
@@ -301,12 +304,16 @@ struct rteth_ctrl {
 	struct rteth_tx_info	tx_info[RTETH_TX_RINGS];
 	struct rteth_tx_data	*tx_data;
 	struct work_struct	reset_work;
+	/* switch driver hook, see <linux/soc/realtek/otto_eth.h> */
+	otto_eth_rx_hook_t	rx_hook;
+	void			*rx_hook_ctx;
 };
 
 struct rteth_cfg {
 	int cpu_port;
 	int max_mtu;
 	int rx_rings;
+	int rx_rings_used;	/* rings served, CPU queue n -> ring n */
 	int tx_rx_enable;
 	int tx_trigger_mask;
 	int mac_l2_port_ctrl;
