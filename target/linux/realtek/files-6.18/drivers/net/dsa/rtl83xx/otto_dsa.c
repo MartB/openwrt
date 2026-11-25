@@ -34,6 +34,7 @@
 #include "stp.h"
 #include "tc.h"
 #include "vlan.h"
+#include "trap.h"
 
 static const u8 ipv4_ll_mcast_addr_base[ETH_ALEN] = {
 	0x01, 0x00, 0x5e, 0x00, 0x00, 0x00
@@ -238,7 +239,16 @@ static int otto_dsa_93xx_setup(struct dsa_switch *ds)
 
 	otto_qos_setup(ds);
 
+	err = otto_trap_setup(priv);
+	if (err)
+		return err;
+
 	return 0;
+}
+
+static void otto_dsa_93xx_teardown(struct dsa_switch *ds)
+{
+	otto_trap_teardown(ds->priv);
 }
 
 static int otto_dsa_port_enable(struct dsa_switch *ds, int port, struct phy_device *phydev)
@@ -828,6 +838,7 @@ const struct dsa_switch_ops rtldsa_83xx_switch_ops = {
 const struct dsa_switch_ops rtldsa_93xx_switch_ops = {
 	.get_tag_protocol	= otto_dsa_get_tag_protocol,
 	.setup			= otto_dsa_93xx_setup,
+	.teardown		= otto_dsa_93xx_teardown,
 
 	.phylink_get_caps	= otto_mac_phylink_get_caps,
 
@@ -893,6 +904,16 @@ const struct dsa_switch_ops rtldsa_93xx_switch_ops = {
 	.port_del_dscp_prio	= otto_qos_port_del_dscp_prio,
 	.port_get_apptrust	= otto_qos_port_get_apptrust,
 	.port_set_apptrust	= otto_qos_port_set_apptrust,
+
+	.devlink_trap_init		= otto_trap_init,
+	.devlink_trap_fini		= otto_trap_fini,
+	.devlink_trap_action_set	= otto_trap_action_set,
+	.devlink_trap_group_init	= otto_trap_group_init,
+	.devlink_trap_group_set		= otto_trap_group_set,
+	.devlink_trap_policer_init	= otto_trap_policer_init,
+	.devlink_trap_policer_fini	= otto_trap_policer_fini,
+	.devlink_trap_policer_set	= otto_trap_policer_set,
+	.devlink_trap_policer_counter_get = otto_trap_policer_counter_get,
 };
 
 /*

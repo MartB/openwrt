@@ -585,6 +585,8 @@ struct rtldsa_config {
 	void (*lag_sync_tables)(struct otto_dsa_priv *priv);
 };
 
+struct otto_trap_ctrl;
+
 struct otto_dsa_priv {
 	/* Switch operation */
 	struct dsa_switch *ds;
@@ -602,6 +604,7 @@ struct otto_dsa_priv {
 	int mirror_group_flower[4];	/* flower rules mirroring through each group */
 	const struct rtldsa_config *r;
 	struct otto_l3_ctrl *l3_ctrl;
+	struct otto_trap_ctrl *trap_ctrl;	/* RTL930x devlink packet traps */
 	u64 irq_mask;
 	struct dentry *dbgfs_dir;
 	struct dentry *stats_dbgfs_dir;
