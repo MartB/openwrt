@@ -69,6 +69,13 @@ struct rtl83xx_flow {
 #define RTL930X_STORM_PORT_CTRL_RATE		GENMASK(23, 0)
 /* the second word of a meter: its bucket in bytes or packets */
 #define RTL930X_STORM_PORT_BURST		GENMASK(15, 0)
+/* one bit per port each: reset the bucket, and the meter dropped frames (stays set) */
+#define RTL930X_STORM_PORT_UC_LB_RST		0x8B58
+#define RTL930X_STORM_PORT_UC_EXCEED		0x8B5C
+#define RTL930X_STORM_PORT_MC_LB_RST		0x8C48
+#define RTL930X_STORM_PORT_MC_EXCEED		0x8C4C
+#define RTL930X_STORM_PORT_BC_LB_RST		0x8D38
+#define RTL930X_STORM_PORT_BC_EXCEED		0x8D3C
 #define RTL930X_STORM_PORT_CTRL_DEFAULT		0x000fffff
 #define RTL930X_STORM_PORT_BURST_DEFAULT	0xff
 
@@ -932,6 +939,30 @@ static int otto_tc_storm_del(struct otto_dsa_priv *priv, int port, struct flow_c
 	return ret;
 }
 
+/* The chip only flags that a meter dropped frames, it does not count them: each time the flag is
+ * found set (and cleared), the rule's drop count grows by one. So "dropped" counts the reads of the
+ * statistics in which the meter had dropped something since the read before.
+ */
+static int otto_tc_storm_stats(struct otto_dsa_priv *priv, int port, struct flow_cls_offload *cls)
+{
+	struct rtldsa_port *p = &priv->ports[port];
+	int type;
+
+	guard(mutex)(&priv->reg_mutex);
+
+	for (type = 0; type < RTLDSA_STORM_NUM; type++) {
+		if (p->storm[type] != cls->cookie)
+			continue;
+
+		if (priv->r->port_storm_exceeded && priv->r->port_storm_exceeded(priv, port, type))
+			flow_stats_update(&cls->stats, 0, 0, 1, jiffies, FLOW_ACTION_HW_STATS_IMMEDIATE);
+
+		return 0;
+	}
+
+	return -ENOENT;
+}
+
 static bool otto_tc_port_rate_police_validate(const struct flow_action_entry *act)
 {
 	if (!act)
@@ -1068,6 +1099,36 @@ int otto_tc_930x_egress_shaper_set(struct otto_dsa_priv *priv, int port, int que
 	return 0;
 }
 
+static const u32 rtl930x_storm_exceed[RTLDSA_STORM_NUM] = {
+	[RTLDSA_STORM_UC] = RTL930X_STORM_PORT_UC_EXCEED,
+	[RTLDSA_STORM_MC] = RTL930X_STORM_PORT_MC_EXCEED,
+	[RTLDSA_STORM_BC] = RTL930X_STORM_PORT_BC_EXCEED,
+};
+
+static const u32 rtl930x_storm_lb_rst[RTLDSA_STORM_NUM] = {
+	[RTLDSA_STORM_UC] = RTL930X_STORM_PORT_UC_LB_RST,
+	[RTLDSA_STORM_MC] = RTL930X_STORM_PORT_MC_LB_RST,
+	[RTLDSA_STORM_BC] = RTL930X_STORM_PORT_BC_LB_RST,
+};
+
+/* Did the meter drop frames since the last call? Clears the flag. */
+bool otto_tc_930x_port_storm_exceeded(struct otto_dsa_priv *priv, int port,
+				      enum rtldsa_storm type)
+{
+	u32 flags;
+
+	if (regmap_read(priv->map, rtl930x_storm_exceed[type], &flags) || !(flags & BIT(port)))
+		return false;
+
+	/* write one to clear; the vendor SDK resets the bucket instead */
+	regmap_write(priv->map, rtl930x_storm_exceed[type], BIT(port));
+	regmap_read(priv->map, rtl930x_storm_exceed[type], &flags);
+	if (flags & BIT(port))
+		regmap_write(priv->map, rtl930x_storm_lb_rst[type], BIT(port));
+
+	return true;
+}
+
 int otto_tc_930x_port_storm_set(struct otto_dsa_priv *priv, int port, enum rtldsa_storm type,
 				const struct rtldsa_storm_cfg *cfg)
 {
@@ -1120,6 +1181,9 @@ int otto_tc_930x_port_storm_set(struct otto_dsa_priv *priv, int port, enum rtlds
 		ctrl |= RTL930X_STORM_PORT_CTRL_ALL;
 
 	regmap_write(priv->map, addr + 4, FIELD_PREP(RTL930X_STORM_PORT_BURST, burst));
+
+	/* a flag left from an earlier meter is not this one's */
+	otto_tc_930x_port_storm_exceeded(priv, port, type);
 
 	return regmap_write(priv->map, addr, ctrl);
 }
@@ -1290,11 +1354,13 @@ int otto_tc_cls_flower_stats(struct dsa_switch *ds, int port,
 	struct otto_dsa_priv *priv = ds->priv;
 	int ret;
 
-	/* only PIE flower rules provide per-rule statistics, and only ingress */
+	/* only PIE flower rules and storm meters provide per-rule statistics, and only ingress */
 	if (!ingress)
 		return 0;
 
 	ret = otto_tc_pie_cls_flower_stats(priv, cls, ingress);
+	if (ret == -ENOENT)
+		ret = otto_tc_storm_stats(priv, port, cls);
 	if (ret == -ENOENT)
 		return 0;
 

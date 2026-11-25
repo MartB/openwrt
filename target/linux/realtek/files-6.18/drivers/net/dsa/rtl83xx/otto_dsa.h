@@ -550,6 +550,8 @@ struct rtldsa_config {
 	/* a NULL cfg switches the meter off */
 	int (*port_storm_set)(struct otto_dsa_priv *priv, int port, enum rtldsa_storm type,
 			      const struct rtldsa_storm_cfg *cfg);
+	/* the meter dropped frames since the last call */
+	bool (*port_storm_exceeded)(struct otto_dsa_priv *priv, int port, enum rtldsa_storm type);
 	void (*qos_init)(struct otto_dsa_priv *priv);
 	int (*trk_mbr_ctr)(int group);
 	void (*lag_switch_init)(struct otto_dsa_priv *priv);
