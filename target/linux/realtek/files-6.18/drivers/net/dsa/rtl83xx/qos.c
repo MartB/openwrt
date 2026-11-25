@@ -46,6 +46,7 @@
 #define RTL93XX_PRI_SEL_TBL_CTRL_OTAG_MASK	GENMASK(19, 16)
 #define RTL93XX_PRI_SEL_TBL_CTRL_ITAG_MASK	GENMASK(15, 12)
 #define RTL93XX_PRI_SEL_TBL_CTRL_DSCP_MASK	GENMASK(11, 8)
+#define RTL930X_PRI_SEL_TBL_CTRL_VACL_MASK	GENMASK(7, 4)
 #define RTL93XX_PRI_SEL_TBL_CTRL_PORT_MASK	GENMASK(3, 0)
 
 /* port: 0-23, index: 0-7 */
@@ -717,10 +718,13 @@ void otto_qos_930x_init(struct otto_dsa_priv *priv)
 {
 	otto_qos_930x_prio2queue_matrix(priv, otto_qos_max_available_queue);
 
-	/* configure priority weights */
+	/* configure priority weights; the priority a flower rule sets (VACL) comes first
+	 * whatever the port trusts
+	 */
 	for (int group = 0; group < ARRAY_SIZE(otto_qos_93xx_trust); group++)
 		regmap_write(priv->map, RTL930X_PRI_SEL_TBL_CTRL(group),
-			     otto_qos_93xx_trust_weights(&otto_qos_93xx_trust[group]));
+			     otto_qos_93xx_trust_weights(&otto_qos_93xx_trust[group]) |
+			     FIELD_PREP(RTL930X_PRI_SEL_TBL_CTRL_VACL_MASK, 8));
 
 	otto_qos_930x_set_scheduling_queue_weights(priv);
 	otto_qos_930x_set_fc_thresholds(priv);

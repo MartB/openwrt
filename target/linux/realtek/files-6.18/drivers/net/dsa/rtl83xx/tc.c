@@ -3,6 +3,7 @@
 #include <net/dsa.h>
 #include <linux/delay.h>
 #include <linux/etherdevice.h>
+#include <linux/if_vlan.h>
 #include <linux/math64.h>
 #include <linux/netdevice.h>
 #include <linux/regmap.h>
@@ -102,6 +103,8 @@ static int otto_tc_parse_flow_rule(struct otto_dsa_priv *priv,
 			 BIT_ULL(FLOW_DISSECTOR_KEY_IPV4_ADDRS) |
 			 BIT_ULL(FLOW_DISSECTOR_KEY_IPV6_ADDRS) |
 			 BIT_ULL(FLOW_DISSECTOR_KEY_PORTS);
+	if (priv->r->pie_qos)
+		supported_keys |= BIT_ULL(FLOW_DISSECTOR_KEY_IP);
 	if (dissector->used_keys & ~supported_keys) {
 		dev_err(priv->dev, "unsupported TC keys: used_keys = 0x%llx\n",
 			dissector->used_keys & ~supported_keys);
@@ -149,10 +152,27 @@ static int otto_tc_parse_flow_rule(struct otto_dsa_priv *priv,
 				flow->rule.frame_type_l4 = 3;
 				break;
 			default:
-				return -EOPNOTSUPP;
+				/* any other protocol: the low byte of the TOS/protocol field */
+				if (!priv->r->pie_qos)
+					return -EOPNOTSUPP;
+				flow->rule.tos_proto |= match.key->ip_proto;
+				flow->rule.tos_proto_m |= 0xff;
+				break;
 			}
-			flow->rule.frame_type_l4_m = 7;
+			if (!flow->rule.tos_proto_m)
+				flow->rule.frame_type_l4_m = 7;
 		}
+	}
+
+	/* the high byte of the TOS/protocol field: IPv4 TOS, IPv6 traffic class */
+	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_IP)) {
+		struct flow_match_ip match;
+
+		flow_rule_match_ip(rule, &match);
+		if (match.mask->ttl || flow->rule.frame_type < 2)
+			return -EOPNOTSUPP;
+		flow->rule.tos_proto |= (u16)match.key->tos << 8;
+		flow->rule.tos_proto_m |= (u16)match.mask->tos << 8;
 	}
 
 	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_ETH_ADDRS)) {
@@ -171,8 +191,16 @@ static int otto_tc_parse_flow_rule(struct otto_dsa_priv *priv,
 
 		dev_dbg(priv->dev, "match VLAN\n");
 		flow_rule_match_vlan(rule, &match);
-		if (match.mask->vlan_priority || match.mask->vlan_dei ||
-		    match.mask->vlan_eth_type)
+		if ((match.mask->vlan_priority && !priv->r->pie_qos) || match.mask->vlan_dei)
+			return -EOPNOTSUPP;
+		/* flower puts the ethertype after the tag in BASIC too, which the frame
+		 * type above matches already (the PIE looks past the tag)
+		 */
+		if (match.mask->vlan_eth_type &&
+		    (!priv->r->pie_qos || match.mask->vlan_eth_type != htons(0xffff) ||
+		     flow->rule.frame_type < 2 ||
+		     match.key->vlan_eth_type != htons(flow->rule.frame_type == 2 ?
+						       ETH_P_IP : ETH_P_IPV6)))
 			return -EOPNOTSUPP;
 		/* cls_flower sets a full vlan_tpid mask for every VLAN-ethertype
 		 * rule; only reject a TPID the PIE cannot match on.
@@ -182,6 +210,15 @@ static int otto_tc_parse_flow_rule(struct otto_dsa_priv *priv,
 			return -EOPNOTSUPP;
 		flow->rule.itag = match.key->vlan_id;
 		flow->rule.itag_m = match.mask->vlan_id;
+		/* the PCP is bits 15:13 of the field; a frame without a tag would show the
+		 * port's priority there, so the frame must carry one
+		 */
+		if (match.mask->vlan_priority) {
+			flow->rule.itag |= (u16)match.key->vlan_priority << 13;
+			flow->rule.itag_m |= (u16)match.mask->vlan_priority << 13;
+			flow->rule.itag_exist = true;
+			flow->rule.itag_exist_m = true;
+		}
 	}
 
 	/* cls_flower keeps IPv4 and IPv6 addresses in one union, so an IPv4
@@ -236,10 +273,16 @@ static void otto_tc_flow_bypass_all(struct rtl83xx_flow *flow)
 	flow->rule.bypass_ibc_sc = true;
 }
 
-static int otto_tc_validate_flow_actions(struct flow_rule *rule)
+/* The actions of a classifying rule: one each of priority, remark of the IP header
+ * and PCP of the egress tag, and nothing else, so that the rule can take blocks of
+ * its own (see otto_pie_930x_block_fits()).
+ */
+static int otto_tc_validate_flow_actions(struct otto_dsa_priv *priv, struct flow_rule *rule,
+					 bool *qos)
 {
 	const struct flow_action_entry *act;
 	bool drop = false, fwd = false;
+	u64 marks = 0;
 	int i, count = 0;
 
 	flow_action_for_each(i, act, &rule->action) {
@@ -255,6 +298,13 @@ static int otto_tc_validate_flow_actions(struct flow_rule *rule)
 				return -EOPNOTSUPP;
 			fwd = true;
 			break;
+		case FLOW_ACTION_PRIORITY:
+		case FLOW_ACTION_MANGLE:
+		case FLOW_ACTION_VLAN_MANGLE:
+			if (!priv->r->pie_qos || (marks & BIT_ULL(act->id)))
+				return -EOPNOTSUPP;
+			marks |= BIT_ULL(act->id);
+			break;
 		default:
 			/* FLOW_ACTION_VLAN_PUSH / _POP map to the ivid/ovid PIE
 			 * action fields via the translation in otto_tc_add_flow(),
@@ -266,8 +316,53 @@ static int otto_tc_validate_flow_actions(struct flow_rule *rule)
 		}
 	}
 
-	if (!count || (drop && count != 1))
+	if (!count || (drop && count != 1) || (marks && fwd))
 		return -EOPNOTSUPP;
+
+	*qos = !!marks;
+	return 0;
+}
+
+/* pedit of the TOS byte (IPv4) or traffic class (IPv6) to a remark: of the DSCP
+ * (ECN kept), of the precedence (the rest kept) or of the whole byte
+ */
+static int otto_tc_parse_remark(const struct flow_action_entry *act, struct rtl83xx_flow *flow)
+{
+	u32 mask = ntohl((__force __be32)act->mangle.mask);
+	u32 val = ntohl((__force __be32)act->mangle.val);
+	u32 changed = ~mask;
+	int shift;
+
+	if (act->mangle.offset != 0)
+		return -EOPNOTSUPP;
+	if (act->mangle.htype == FLOW_ACT_MANGLE_HDR_TYPE_IP4 && flow->rule.frame_type == 2)
+		shift = 16;
+	else if (act->mangle.htype == FLOW_ACT_MANGLE_HDR_TYPE_IP6 && flow->rule.frame_type == 3)
+		shift = 20;
+	else
+		return -EOPNOTSUPP;
+	if (changed & ~(0xffU << shift))
+		return -EOPNOTSUPP;
+
+	changed >>= shift;
+	val = (val >> shift) & changed;
+	switch (changed) {
+	case 0xfc:
+		flow->rule.rmk_act = 0;
+		flow->rule.rmk_data = val >> 2;
+		break;
+	case 0xe0:
+		flow->rule.rmk_act = 1;
+		flow->rule.rmk_data = val >> 5;
+		break;
+	case 0xff:
+		flow->rule.rmk_act = 2;
+		flow->rule.rmk_data = val;
+		break;
+	default:
+		return -EOPNOTSUPP;
+	}
+	flow->rule.rmk_sel = true;
 
 	return 0;
 }
@@ -308,7 +403,7 @@ static int otto_tc_add_flow(struct otto_dsa_priv *priv, struct flow_cls_offload 
 					FLOW_ACTION_HW_STATS_IMMEDIATE_BIT))
 		return -EOPNOTSUPP;
 
-	err = otto_tc_validate_flow_actions(rule);
+	err = otto_tc_validate_flow_actions(priv, rule, &flow->rule.qos);
 	if (err)
 		return err;
 
@@ -318,6 +413,32 @@ static int otto_tc_add_flow(struct otto_dsa_priv *priv, struct flow_cls_offload 
 
 	flow_action_for_each(i, act, &rule->action) {
 		switch (act->id) {
+		case FLOW_ACTION_PRIORITY:
+			/* priority n is queue n (otto_qos_930x_prio2queue_matrix()) */
+			if (act->priority >= MAX_PRIOS)
+				return -EOPNOTSUPP;
+			flow->rule.nopri_sel = true;
+			flow->rule.nopri_data = act->priority;
+			break;
+
+		case FLOW_ACTION_MANGLE:
+			err = otto_tc_parse_remark(act, flow);
+			if (err)
+				return err;
+			break;
+
+		case FLOW_ACTION_VLAN_MANGLE:
+			/* the hardware sets only the PCP: the rule has to keep the VLAN it
+			 * matches
+			 */
+			if (act->vlan.proto != htons(ETH_P_8021Q) ||
+			    (flow->rule.itag_m & VLAN_VID_MASK) != VLAN_VID_MASK ||
+			    (flow->rule.itag & VLAN_VID_MASK) != act->vlan.vid)
+				return -EOPNOTSUPP;
+			flow->rule.ipri_sel = true;
+			flow->rule.ipri_data = act->vlan.prio;
+			break;
+
 		case FLOW_ACTION_DROP:
 			dev_dbg(priv->dev, "action DROP\n");
 			flow->rule.drop = true;
@@ -331,10 +452,6 @@ static int otto_tc_add_flow(struct otto_dsa_priv *priv, struct flow_cls_offload 
 			flow->rule.fwd_act = PIE_ACT_REDIRECT_TO_PORT;
 			otto_tc_flow_bypass_all(flow);
 			break;
-
-		case FLOW_ACTION_MANGLE:
-			dev_err(priv->dev, "unsupported action: MANGLE\n");
-			return -EOPNOTSUPP;
 
 		case FLOW_ACTION_ADD:
 			dev_err(priv->dev, "unsupported action: ADD\n");

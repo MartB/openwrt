@@ -306,6 +306,11 @@ struct pie_rule {
 	bool bypass_sel;	/* Bypass actions */
 	bool fwd_sa_lrn;	/* Learn the source address when forwarding */
 	bool fwd_mod_to_cpu;	/* Forward the modified VLAN tag format to CPU-port */
+	bool ipri_sel;		/* Set the priority (PCP) of the egress inner tag */
+	/* Only classifies (priority, remark): kept in PIE blocks of its own, so that it
+	 * neither hides nor is hidden by a rule that drops or forwards
+	 */
+	bool qos;
 
 	/* Fields used in predefined templates 0-2 on RTL8380 / 90 / 9300 */
 	u64 spm;		/* Source Port Matrix */
@@ -361,7 +366,9 @@ struct pie_rule {
 	u8 mpls_act;		/* MPLS action type */
 	u16 mpls_lib_idx;	/* MPLS action data */
 
+	u8 rmk_act;		/* RTL930x: 0 DSCP, 1 IP precedence, 2 TOS */
 	u16 rmk_data;		/* Data for remarking */
+	u8 ipri_data;		/* PCP of the egress inner tag */
 	u16 meter_data;		/* ID of meter for bandwidth control */
 	u16 tagst_data;
 	u16 mir_data;
@@ -421,6 +428,10 @@ struct rtldsa_config {
 	/* The PIE takes ingress tc flower rules */
 	bool pie_cls_flower;
 	bool pie_mirror_group;
+	/* flower rules may classify: match TOS/DSCP, PCP and any IP protocol, set the
+	 * priority, remark DSCP/precedence/TOS and the PCP of the egress tag
+	 */
+	bool pie_qos;
 	u8 num_lag_ids;
 	u8 cpu_port;
 	u8 port_ignore;
@@ -584,6 +595,7 @@ struct otto_dsa_priv {
 	struct mutex reg_mutex;		/* Mutex for individual register manipulations */
 	struct mutex pie_mutex;		/* Mutex for Packet Inspection Engine */
 	u32 pie_failed_blocks;		/* RTL930x blocks disabled after failed rollback */
+	u32 pie_qos_blocks;		/* RTL930x blocks holding classifying (qos) rules */
 	int link_state_irq;
 	bool link_state_irq_requested;
 	int mirror_group_ports[4];

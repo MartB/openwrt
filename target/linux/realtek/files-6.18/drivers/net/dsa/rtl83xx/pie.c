@@ -2,11 +2,13 @@
 
 #include <asm/mach-rtl-otto/mach-rtl-otto.h>
 #include <linux/bitmap.h>
+#include <linux/debugfs.h>
 #include <linux/errno.h>
 #include <linux/etherdevice.h>
 #include <linux/iopoll.h>
 #include <linux/lockdep.h>
 #include <linux/regmap.h>
+#include <linux/seq_file.h>
 
 #include "pie.h"
 #include "otto_dsa.h"
@@ -2357,6 +2359,20 @@ static void otto_pie_930x_write_action(u32 r[],  struct pie_rule *pr)
 	r[17] |= ((u32)(pr->tagst_data) & 0xf) << 28;
 	r[17] |= ((u32)(pr->nopri_data) & 0x7) << 25;
 	r[17] |= pr->bypass_ibc_sc ? BIT(16) : 0;
+
+	/* SDK longan IACL/VACL: ACT_MSK_REMARK bit 168, REMARK_ACT 31:30 and
+	 * REMARK_VALUE 29:22 of the last word; ACT_MSK_IPRI bit 160, IVLAN_PRI_ACT
+	 * 100:99 (0: assign) and IVLAN_PRI 98:96
+	 */
+	if (pr->rmk_sel) {
+		r[13] |= BIT(8);
+		r[18] |= ((u32)(pr->rmk_act) & 0x3) << 30;
+		r[18] |= ((u32)(pr->rmk_data) & 0xff) << 22;
+	}
+	if (pr->ipri_sel) {
+		r[13] |= BIT(0);
+		r[15] |= (u32)(pr->ipri_data) & 0x7;
+	}
 }
 
 void otto_pie_930x_rule_dump_raw(u32 r[])
@@ -2510,9 +2526,30 @@ static int otto_pie_930x_verify_template(struct otto_dsa_priv *priv,
 	if (pr->dport_m && !otto_pie_930x_templ_has(t, RTL930X_TEMPLATE_FIELD_L4_DPORT))
 		return -1;
 
+	if (pr->tos_proto_m && !otto_pie_930x_templ_has(t, RTL930X_TEMPLATE_FIELD_IP_TOS_PROTO))
+		return -1;
+
 	/* TODO: Check more */
 
 	return otto_pie_find_free_slot(priv, block);
+}
+
+static bool otto_pie_block_empty(struct otto_dsa_priv *priv, int block)
+{
+	unsigned long first = block * PIE_BLOCK_SIZE, end = first + PIE_BLOCK_SIZE;
+
+	return find_next_bit(priv->pie_use_bm, end, first) >= end;
+}
+
+/* Only one rule of a block acts on a frame, the hits of all blocks act together:
+ * a rule that only classifies takes blocks that hold no other kind of rule
+ */
+static bool otto_pie_930x_block_fits(struct otto_dsa_priv *priv, struct pie_rule *pr, int block)
+{
+	if (otto_pie_block_empty(priv, block))
+		return true;
+
+	return !!(priv->pie_qos_blocks & BIT(block)) == pr->qos;
 }
 
 int otto_pie_930x_rule_add(struct otto_dsa_priv *priv, struct pie_rule *pr)
@@ -2532,6 +2569,8 @@ int otto_pie_930x_rule_add(struct otto_dsa_priv *priv, struct pie_rule *pr)
 
 	for (block = min_block; block < max_block; block++) {
 		if (priv->pie_failed_blocks & BIT(block))
+			continue;
+		if (!otto_pie_930x_block_fits(priv, pr, block))
 			continue;
 		err = regmap_read(priv->map, RTL930X_PIE_BLK_TMPLTE_CTRL(block), &t_select);
 		if (err)
@@ -2555,6 +2594,10 @@ int otto_pie_930x_rule_add(struct otto_dsa_priv *priv, struct pie_rule *pr)
 	}
 
 	pr_debug("Using block: %d, index %d, template-id %d\n", block, idx, j);
+	if (pr->qos)
+		priv->pie_qos_blocks |= BIT(block);
+	else if (otto_pie_block_empty(priv, block))
+		priv->pie_qos_blocks &= ~BIT(block);
 	set_bit(idx, priv->pie_use_bm);
 
 	pr->valid = true;
@@ -2614,11 +2657,57 @@ void otto_pie_930x_rule_rm(struct otto_dsa_priv *priv, struct pie_rule *pr)
 		clear_bit(idx, priv->pie_use_bm);
 }
 
+/* debugfs realtek_otto_pie/rules: the rows in use, as the chip holds them (word 0
+ * first, as otto_pie_930x_rule_write() builds them), and the blocks of classifying
+ * rules
+ */
+static int otto_pie_930x_rules_show(struct seq_file *m, void *v)
+{
+	struct otto_dsa_priv *priv = m->private;
+	int n = priv->r->n_pie_blocks * PIE_BLOCK_SIZE;
+
+	guard(mutex)(&priv->pie_mutex);
+
+	seq_printf(m, "qos blocks: %08x\n", priv->pie_qos_blocks);
+	for (int idx = 0; idx < n; idx++) {
+		u32 r[19] = {};
+
+		if (!test_bit(idx, priv->pie_use_bm))
+			continue;
+		if (otto_table_read(RTL9300_TBL_IACL, idx, &r))
+			continue;
+		seq_printf(m, "%4d:", idx);
+		for (int i = 0; i < ARRAY_SIZE(r); i++)
+			seq_printf(m, " %08x", r[i]);
+		seq_putc(m, '\n');
+	}
+
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(otto_pie_930x_rules);
+
+static void otto_pie_dbgfs_remove(void *data)
+{
+	debugfs_remove_recursive(data);
+}
+
+static void otto_pie_930x_dbgfs_init(struct otto_dsa_priv *priv)
+{
+	struct dentry *root = debugfs_create_dir("realtek_otto_pie", NULL);
+
+	if (IS_ERR(root))
+		return;
+	if (devm_add_action_or_reset(priv->dev, otto_pie_dbgfs_remove, root))
+		return;
+	debugfs_create_file("rules", 0400, root, priv, &otto_pie_930x_rules_fops);
+}
+
 void otto_pie_930x_init(struct otto_dsa_priv *priv)
 {
 	u32 template_selectors;
 
 	mutex_init(&priv->pie_mutex);
+	otto_pie_930x_dbgfs_init(priv);
 
 	guard(mutex)(&priv->pie_mutex);
 
