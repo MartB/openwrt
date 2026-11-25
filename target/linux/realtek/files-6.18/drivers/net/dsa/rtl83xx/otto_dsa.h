@@ -109,6 +109,21 @@ struct rtldsa_ets {
 	struct rtldsa_red queue_red[MAX_PRIOS];
 };
 
+/* The storm control meters of a port, each limiting what it receives of one kind of traffic */
+enum rtldsa_storm {
+	RTLDSA_STORM_UC,
+	RTLDSA_STORM_MC,
+	RTLDSA_STORM_BC,
+	RTLDSA_STORM_NUM,
+};
+
+struct rtldsa_storm_cfg {
+	bool pps;		/* rate and burst count packets, else bytes */
+	bool unknown_only;	/* unicast, multicast: only frames without a forwarding entry */
+	u64 rate;		/* per second */
+	u64 burst;
+};
+
 struct rtldsa_port {
 	bool enable:1;
 	bool phy:1;
@@ -116,8 +131,12 @@ struct rtldsa_port {
 	bool qinq:1;
 	bool bridged:1;
 	bool vlan_filtering:1;
+	/* the meters of a port share their unit, valid while one of them is in use */
+	bool storm_pps:1;
 	unsigned long rate_police_egress;
 	unsigned long rate_police_ingress;
+	/* the cookie of the flower rule using each storm meter, 0 when unused */
+	unsigned long storm[RTLDSA_STORM_NUM];
 	u32 ets_handle;
 	u16 ets_children;
 	bool ets_offloadable;
@@ -528,6 +547,9 @@ struct rtldsa_config {
 	void (*red_drops_update)(struct otto_dsa_priv *priv, int port);
 	int (*egress_shaper_set)(struct otto_dsa_priv *priv, int port, int queue,
 				 u64 rate_bytes_ps, u32 burst);
+	/* a NULL cfg switches the meter off */
+	int (*port_storm_set)(struct otto_dsa_priv *priv, int port, enum rtldsa_storm type,
+			      const struct rtldsa_storm_cfg *cfg);
 	void (*qos_init)(struct otto_dsa_priv *priv);
 	int (*trk_mbr_ctr)(int group);
 	void (*lag_switch_init)(struct otto_dsa_priv *priv);

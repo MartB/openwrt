@@ -6,6 +6,8 @@
 #include <linux/types.h>
 #include <net/pkt_cls.h>
 
+#include "otto_dsa.h"
+
 struct dsa_switch;
 struct otto_dsa_priv;
 
@@ -27,6 +29,8 @@ int otto_tc_930x_port_rate_police_del(struct dsa_switch *ds, int port,
 				      bool ingress);
 int otto_tc_930x_egress_shaper_set(struct otto_dsa_priv *priv, int port, int queue,
 				   u64 rate_bytes_ps, u32 burst);
+int otto_tc_930x_port_storm_set(struct otto_dsa_priv *priv, int port, enum rtldsa_storm type,
+				const struct rtldsa_storm_cfg *cfg);
 int otto_tc_931x_port_rate_police_add(struct dsa_switch *ds, int port,
 				      const struct flow_action_entry *act,
 				      bool ingress);

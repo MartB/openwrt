@@ -51,6 +51,27 @@ struct rtl83xx_flow {
 #define RTL930X_INGRESS_FC_CTRL(port)		(0x81CC + ((port / 29) * 4))
 #define RTL930X_INGRESS_FC_CTRL_EN(port)	BIT(port % 29)
 
+/* Storm control: a leaky bucket per port for unicast, multicast and broadcast */
+#define RTL930X_STORM_CTRL			0x8A60
+#define RTL930X_STORM_CTRL_ADMIT_RTKPKT		BIT(1)
+#define RTL930X_STORM_CTRL_ADMIT_BPDU		BIT(2)
+#define RTL930X_STORM_CTRL_ADMIT_RMA		BIT(3)
+#define RTL930X_STORM_LB_CTRL			0x8A64
+#define RTL930X_STORM_LB_CTRL_TOKEN		GENMASK(15, 0)
+/* one bit per port: the port's meters count bytes (16 kbit/s units), else packets */
+#define RTL930X_STORM_PORT_MODE			0x8A6C
+#define RTL930X_STORM_PORT_UC_CTRL(port)	(0x8A70 + ((port) * 8))
+#define RTL930X_STORM_PORT_MC_CTRL(port)	(0x8B60 + ((port) * 8))
+#define RTL930X_STORM_PORT_BC_CTRL(port)	(0x8C50 + ((port) * 8))
+/* unicast and multicast: known and unknown destinations, else unknown ones only */
+#define RTL930X_STORM_PORT_CTRL_ALL		BIT(25)
+#define RTL930X_STORM_PORT_CTRL_EN		BIT(24)
+#define RTL930X_STORM_PORT_CTRL_RATE		GENMASK(23, 0)
+/* the second word of a meter: its bucket in bytes or packets */
+#define RTL930X_STORM_PORT_BURST		GENMASK(15, 0)
+#define RTL930X_STORM_PORT_CTRL_DEFAULT		0x000fffff
+#define RTL930X_STORM_PORT_BURST_DEFAULT	0xff
+
 /* Parse the flow rule for the matching conditions */
 static int otto_tc_parse_flow_rule(struct otto_dsa_priv *priv,
 				   struct flow_rule *rule, struct rtl83xx_flow *flow)
@@ -729,17 +750,14 @@ otto_tc_rate_policy_extract(struct flow_cls_offload *cls)
 	return &rule->action.entries[0];
 }
 
-static bool otto_tc_flower_matches_all(struct flow_cls_offload *cls)
+/* No match on the protocol or on anything the basic and control keys carry */
+static bool otto_tc_flower_any_proto(struct flow_cls_offload *cls)
 {
 	struct flow_rule *rule = flow_cls_offload_flow_rule(cls);
 	struct flow_match_control control;
 	struct flow_match_basic basic;
 
 	if (cls->common.chain_index || cls->common.protocol != htons(ETH_P_ALL))
-		return false;
-
-	if (rule->match.dissector->used_keys &
-	    ~(BIT_ULL(FLOW_DISSECTOR_KEY_CONTROL) | BIT_ULL(FLOW_DISSECTOR_KEY_BASIC)))
 		return false;
 
 	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_BASIC)) {
@@ -755,6 +773,163 @@ static bool otto_tc_flower_matches_all(struct flow_cls_offload *cls)
 	}
 
 	return true;
+}
+
+static bool otto_tc_flower_matches_all(struct flow_cls_offload *cls)
+{
+	struct flow_rule *rule = flow_cls_offload_flow_rule(cls);
+
+	if (rule->match.dissector->used_keys &
+	    ~(BIT_ULL(FLOW_DISSECTOR_KEY_CONTROL) | BIT_ULL(FLOW_DISSECTOR_KEY_BASIC)))
+		return false;
+
+	return otto_tc_flower_any_proto(cls);
+}
+
+/* A police action on all broadcast, multicast or unicast frames is the storm control of the
+ * port, with one meter for each of the three, by the destination address:
+ *
+ *   dst_mac ff:ff:ff:ff:ff:ff                         broadcast
+ *   dst_mac 01:00:00:00:00:00/01:00:00:00:00:00       multicast, broadcast not counted
+ *   dst_mac 00:00:00:00:00:00/01:00:00:00:00:00       unicast
+ *
+ * With "l2_miss 1" the unicast and multicast meters see only the frames the switch floods for
+ * lack of a forwarding entry (unknown unicast, unregistered multicast). Returns the meter, or -1
+ * when the rule is something else.
+ */
+static int otto_tc_storm_match(struct flow_cls_offload *cls, bool *unknown_only)
+{
+	static const u8 group_bit[ETH_ALEN] = { 0x01 };
+	struct flow_rule *rule = flow_cls_offload_flow_rule(cls);
+	struct flow_match_eth_addrs addrs;
+	struct flow_match_meta meta;
+	int type;
+
+	if (rule->match.dissector->used_keys &
+	    ~(BIT_ULL(FLOW_DISSECTOR_KEY_CONTROL) | BIT_ULL(FLOW_DISSECTOR_KEY_BASIC) |
+	      BIT_ULL(FLOW_DISSECTOR_KEY_ETH_ADDRS) | BIT_ULL(FLOW_DISSECTOR_KEY_META)))
+		return -1;
+
+	if (!otto_tc_flower_any_proto(cls) || !flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_ETH_ADDRS))
+		return -1;
+
+	flow_rule_match_eth_addrs(rule, &addrs);
+	if (!is_zero_ether_addr(addrs.mask->src))
+		return -1;
+
+	if (is_broadcast_ether_addr(addrs.mask->dst)) {
+		if (!is_broadcast_ether_addr(addrs.key->dst))
+			return -1;
+		type = RTLDSA_STORM_BC;
+	} else if (ether_addr_equal(addrs.mask->dst, group_bit)) {
+		type = is_multicast_ether_addr(addrs.key->dst) ? RTLDSA_STORM_MC : RTLDSA_STORM_UC;
+	} else {
+		return -1;
+	}
+
+	*unknown_only = false;
+	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_META)) {
+		flow_rule_match_meta(rule, &meta);
+		if (meta.mask->ingress_ifindex || meta.mask->ingress_iftype)
+			return -1;
+		/* there is no meter for the known destinations alone */
+		if (meta.mask->l2_miss && !meta.key->l2_miss)
+			return -1;
+		/* broadcast has no forwarding entry, so it is all unknown anyway */
+		*unknown_only = meta.mask->l2_miss && type != RTLDSA_STORM_BC;
+	}
+
+	return type;
+}
+
+static int otto_tc_storm_add(struct otto_dsa_priv *priv, int port, struct flow_cls_offload *cls,
+			     const struct flow_action_entry *act, int type, bool unknown_only)
+{
+	static const char * const names[RTLDSA_STORM_NUM] = {
+		[RTLDSA_STORM_UC] = "unicast",
+		[RTLDSA_STORM_MC] = "multicast",
+		[RTLDSA_STORM_BC] = "broadcast",
+	};
+	struct netlink_ext_ack *extack = cls->common.extack;
+	struct rtldsa_port *p = &priv->ports[port];
+	struct rtldsa_storm_cfg cfg = {
+		.unknown_only = unknown_only,
+	};
+	int i, ret;
+
+	if (!priv->r->port_storm_set) {
+		NL_SET_ERR_MSG_MOD(extack, "this switch has no storm control");
+		return -EOPNOTSUPP;
+	}
+
+	if (act->police.exceed.act_id != FLOW_ACTION_DROP ||
+	    act->police.notexceed.act_id != FLOW_ACTION_ACCEPT) {
+		NL_SET_ERR_MSG_MOD(extack, "storm control drops what exceeds: conform-exceed drop/ok");
+		return -EOPNOTSUPP;
+	}
+
+	if (act->police.peakrate_bytes_ps || act->police.avrate || act->police.overhead) {
+		NL_SET_ERR_MSG_MOD(extack, "storm control has a rate and a burst only");
+		return -EOPNOTSUPP;
+	}
+
+	cfg.pps = act->police.rate_pkt_ps > 0;
+	cfg.rate = cfg.pps ? act->police.rate_pkt_ps : act->police.rate_bytes_ps;
+	cfg.burst = cfg.pps ? act->police.burst_pkt : act->police.burst;
+	if (!cfg.rate) {
+		NL_SET_ERR_MSG_MOD(extack, "storm control needs a rate");
+		return -EOPNOTSUPP;
+	}
+
+	mutex_lock(&priv->reg_mutex);
+
+	if (p->storm[type]) {
+		NL_SET_ERR_MSG_FMT_MOD(extack, "the port's %s storm control is in use", names[type]);
+		ret = -EBUSY;
+		goto unlock;
+	}
+
+	for (i = 0; i < RTLDSA_STORM_NUM; i++) {
+		if (p->storm[i] && p->storm_pps != cfg.pps) {
+			NL_SET_ERR_MSG_MOD(extack,
+					   "a port's storm controls all count packets or all count bytes");
+			ret = -EOPNOTSUPP;
+			goto unlock;
+		}
+	}
+
+	ret = priv->r->port_storm_set(priv, port, type, &cfg);
+	if (ret)
+		goto unlock;
+
+	p->storm[type] = cls->cookie;
+	p->storm_pps = cfg.pps;
+
+unlock:
+	mutex_unlock(&priv->reg_mutex);
+
+	return ret;
+}
+
+static int otto_tc_storm_del(struct otto_dsa_priv *priv, int port, struct flow_cls_offload *cls)
+{
+	struct rtldsa_port *p = &priv->ports[port];
+	int type, ret = -ENOENT;
+
+	mutex_lock(&priv->reg_mutex);
+
+	for (type = 0; type < RTLDSA_STORM_NUM; type++) {
+		if (!priv->r->port_storm_set || p->storm[type] != cls->cookie)
+			continue;
+
+		p->storm[type] = 0;
+		ret = priv->r->port_storm_set(priv, port, type, NULL);
+		break;
+	}
+
+	mutex_unlock(&priv->reg_mutex);
+
+	return ret;
 }
 
 static bool otto_tc_port_rate_police_validate(const struct flow_action_entry *act)
@@ -893,6 +1068,62 @@ int otto_tc_930x_egress_shaper_set(struct otto_dsa_priv *priv, int port, int que
 	return 0;
 }
 
+int otto_tc_930x_port_storm_set(struct otto_dsa_priv *priv, int port, enum rtldsa_storm type,
+				const struct rtldsa_storm_cfg *cfg)
+{
+	static const u32 ctrl_base[RTLDSA_STORM_NUM] = {
+		[RTLDSA_STORM_UC] = RTL930X_STORM_PORT_UC_CTRL(0),
+		[RTLDSA_STORM_MC] = RTL930X_STORM_PORT_MC_CTRL(0),
+		[RTLDSA_STORM_BC] = RTL930X_STORM_PORT_BC_CTRL(0),
+	};
+	u32 addr = ctrl_base[type] + port * 8;
+	u32 ctrl, burst, lb_ctrl;
+	u64 rate;
+	int i;
+
+	if (!cfg) {
+		regmap_write(priv->map, addr, RTL930X_STORM_PORT_CTRL_DEFAULT);
+		regmap_write(priv->map, addr + 4, RTL930X_STORM_PORT_BURST_DEFAULT);
+
+		/* back to the reset default once the port's last meter is off */
+		for (i = 0; i < RTLDSA_STORM_NUM; i++)
+			if (priv->ports[port].storm[i])
+				return 0;
+
+		return regmap_clear_bits(priv->map, RTL930X_STORM_PORT_MODE, BIT(port));
+	}
+
+	if (cfg->pps) {
+		rate = cfg->rate;
+		burst = clamp_t(u64, cfg->burst, 1, U16_MAX);
+	} else {
+		/* 16 kbit/s units; the bucket holds at least three of the tokens it is refilled
+		 * with, as for the egress shaper
+		 */
+		regmap_read(priv->map, RTL930X_STORM_LB_CTRL, &lb_ctrl);
+		rate = DIV_ROUND_UP_ULL(cfg->rate, 2000);
+		burst = clamp_t(u64, cfg->burst, 3 * FIELD_GET(RTL930X_STORM_LB_CTRL_TOKEN, lb_ctrl),
+				U16_MAX);
+	}
+	rate = clamp_t(u64, rate, 1, RTL930X_STORM_PORT_CTRL_RATE);
+
+	/* spanning tree, LACP, LLDP, 802.1X and the like are never held back by a storm */
+	regmap_set_bits(priv->map, RTL930X_STORM_CTRL,
+			RTL930X_STORM_CTRL_ADMIT_RTKPKT | RTL930X_STORM_CTRL_ADMIT_BPDU |
+			RTL930X_STORM_CTRL_ADMIT_RMA);
+
+	regmap_update_bits(priv->map, RTL930X_STORM_PORT_MODE, BIT(port),
+			   cfg->pps ? 0 : BIT(port));
+
+	ctrl = FIELD_PREP(RTL930X_STORM_PORT_CTRL_RATE, rate) | RTL930X_STORM_PORT_CTRL_EN;
+	if (type != RTLDSA_STORM_BC && !cfg->unknown_only)
+		ctrl |= RTL930X_STORM_PORT_CTRL_ALL;
+
+	regmap_write(priv->map, addr + 4, FIELD_PREP(RTL930X_STORM_PORT_BURST, burst));
+
+	return regmap_write(priv->map, addr, ctrl);
+}
+
 int otto_tc_931x_port_rate_police_add(struct dsa_switch *ds, int port,
 				      const struct flow_action_entry *act,
 				      bool ingress)
@@ -958,10 +1189,18 @@ int otto_tc_cls_flower_add(struct dsa_switch *ds, int port,
 	struct otto_dsa_priv *priv = ds->priv;
 	struct rtldsa_port *p = &priv->ports[port];
 	const struct flow_action_entry *act;
-	int ret;
+	bool unknown_only;
+	int ret, storm;
 
 	/* a single rate/bandwidth limiter action on all frames is handled as port policing */
 	act = otto_tc_rate_policy_extract(cls);
+
+	/* on all broadcast, multicast or unicast frames it is storm control */
+	if (act && ingress) {
+		storm = otto_tc_storm_match(cls, &unknown_only);
+		if (storm >= 0)
+			return otto_tc_storm_add(priv, port, cls, act, storm, unknown_only);
+	}
 
 	/* everything else is offloaded to the PIE engine */
 	if (!otto_tc_port_rate_police_validate(act) || !otto_tc_flower_matches_all(cls))
@@ -1010,6 +1249,10 @@ int otto_tc_cls_flower_del(struct dsa_switch *ds, int port,
 	 */
 	if (ingress) {
 		ret = otto_tc_pie_cls_flower_del(priv, cls, ingress);
+		if (ret != -ENOENT)
+			return ret;
+
+		ret = otto_tc_storm_del(priv, port, cls);
 		if (ret != -ENOENT)
 			return ret;
 	}
