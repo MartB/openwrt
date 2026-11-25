@@ -1,0 +1,214 @@
+--- a/worker.h
++++ b/worker.h
+@@ -14,6 +14,8 @@
+ #ifndef __WORKER_H
+ #define __WORKER_H
+ 
++#include <net/if.h>
++
+ #include "mstp.h"
+ 
+ enum worker_event_type {
+@@ -23,6 +25,7 @@
+ 	WORKER_EV_BRIDGE_ADD,
+ 	WORKER_EV_BRIDGE_REMOVE,
+ 	WORKER_EV_ONE_SECOND,
++	WORKER_EV_PORT_CONFIG,
+ };
+ 
+ struct worker_event {
+@@ -31,6 +34,9 @@
+ 	int bridge_idx;
+ 	CIST_BridgeConfig bridge_config;
+ 	unsigned int bridge_priority;
++
++	char port_name[IFNAMSIZ];
++	CIST_PortConfig port_config;
+ };
+ 
+ int worker_init(void);
+--- a/worker.c
++++ b/worker.c
+@@ -73,6 +73,9 @@
+ 	case WORKER_EV_BRIDGE_REMOVE:
+ 		bridge_delete(ev->bridge_idx);
+ 		break;
++	case WORKER_EV_PORT_CONFIG:
++		bridge_port_config(ev->port_name, &ev->port_config);
++		break;
+ 	default:
+ 		return;
+ 	}
+--- a/bridge_track.h
++++ b/bridge_track.h
+@@ -26,6 +26,8 @@
+ int bridge_create(int bridge_idx, CIST_BridgeConfig *cfg,
+ 		  unsigned int priority);
+ void bridge_delete(int bridge_idx);
++/* per-port settings by interface name, kept for ports that join later */
++void bridge_port_config(const char *name, const CIST_PortConfig *cfg);
+ int bridge_track_fini(void);
+ 
+ #endif
+--- a/bridge_track.c
++++ b/bridge_track.c
+@@ -85,6 +85,72 @@
+     return NULL;
+ }
+ 
++/* Port settings given over ubus (port_config), by interface name: applied
++ * to the port now and again whenever it joins a bridge. Worker thread only. */
++struct port_config_entry {
++    struct list_head list;
++    char name[IFNAMSIZ];
++    CIST_PortConfig cfg;
++};
++static LIST_HEAD(port_configs);
++
++static struct port_config_entry *port_config_find(const char *name)
++{
++    struct port_config_entry *pc;
++    list_for_each_entry(pc, &port_configs, list)
++    {
++        if(!strcmp(pc->name, name))
++            return pc;
++    }
++    return NULL;
++}
++
++static void port_config_apply(port_t *prt, const CIST_PortConfig *cfg)
++{
++    CIST_PortConfig c = *cfg;
++    if(MSTP_IN_set_cist_port_config(prt, &c))
++        ERROR_PRTNAME(prt->bridge, prt, "port config not taken");
++}
++
++void bridge_port_config(const char *name, const CIST_PortConfig *cfg)
++{
++    struct port_config_entry *pc = port_config_find(name);
++    bridge_t *br;
++    port_t *prt;
++
++    if(!pc)
++    {
++        TST((pc = calloc(1, sizeof(*pc))) != NULL,);
++        strncpy(pc->name, name, IFNAMSIZ - 1);
++        list_add_tail(&pc->list, &port_configs);
++    }
++    /* each call says what it sets; keep what an earlier one set */
++    if(cfg->set_admin_edge_port)
++    {
++        pc->cfg.admin_edge_port = cfg->admin_edge_port;
++        pc->cfg.set_admin_edge_port = true;
++    }
++    if(cfg->set_auto_edge_port)
++    {
++        pc->cfg.auto_edge_port = cfg->auto_edge_port;
++        pc->cfg.set_auto_edge_port = true;
++    }
++    if(cfg->set_bpdu_guard_port)
++    {
++        pc->cfg.bpdu_guard_port = cfg->bpdu_guard_port;
++        pc->cfg.set_bpdu_guard_port = true;
++    }
++
++    list_for_each_entry(br, &bridges, list)
++    {
++        list_for_each_entry(prt, &br->ports, br_list)
++        {
++            if(!strcmp(prt->sysdeps.name, name))
++                port_config_apply(prt, &pc->cfg);
++        }
++    }
++}
++
+ static port_t * create_if(bridge_t * br, int if_index)
+ {
+     port_t *prt;
+@@ -115,6 +181,10 @@
+     if(!MSTP_IN_port_create_and_add_tail(prt, portno))
+         goto err;
+ 
++    struct port_config_entry *pc = port_config_find(prt->sysdeps.name);
++    if(pc)
++        port_config_apply(prt, &pc->cfg);
++
+     return prt;
+ err:
+     free(prt);
+--- a/ubus.c
++++ b/ubus.c
+@@ -11,6 +11,7 @@
+  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+  * GNU General Public License for more details.
+  */
++#include <string.h>
+ #include <libubus.h>
+ #include <libubox/uloop.h>
+ #include "config.h"
+@@ -159,9 +160,65 @@
+ 	return 0;
+ }
+ 
++enum port_config_attr {
++	PORT_CONFIG_NAME,
++	PORT_CONFIG_ADMIN_EDGE,
++	PORT_CONFIG_AUTO_EDGE,
++	PORT_CONFIG_BPDU_GUARD,
++	__PORT_CONFIG_MAX
++};
++
++static const struct blobmsg_policy port_config_policy[__PORT_CONFIG_MAX] = {
++	[PORT_CONFIG_NAME] = { "name", BLOBMSG_TYPE_STRING },
++	[PORT_CONFIG_ADMIN_EDGE] = { "admin_edge", BLOBMSG_TYPE_BOOL },
++	[PORT_CONFIG_AUTO_EDGE] = { "auto_edge", BLOBMSG_TYPE_BOOL },
++	[PORT_CONFIG_BPDU_GUARD] = { "bpdu_guard", BLOBMSG_TYPE_BOOL },
++};
++
++/* A bridge port's edge and BPDU guard settings, by interface name: kept, and
++ * applied again when the port joins a bridge (again). BPDU guard shuts the
++ * port down (IFF_UP off) when a BPDU comes in; setting it up again clears it. */
++static int
++ubus_port_config(struct ubus_context *ctx, struct ubus_object *obj,
++		 struct ubus_request_data *req, const char *method,
++		 struct blob_attr *msg)
++{
++	struct blob_attr *tb[__PORT_CONFIG_MAX], *cur;
++	struct worker_event ev = { .type = WORKER_EV_PORT_CONFIG };
++	const char *name;
++
++	blobmsg_parse(port_config_policy, __PORT_CONFIG_MAX, tb,
++		      blobmsg_data(msg), blobmsg_len(msg));
++
++	if (!tb[PORT_CONFIG_NAME])
++		return UBUS_STATUS_INVALID_ARGUMENT;
++	name = blobmsg_get_string(tb[PORT_CONFIG_NAME]);
++	if (!*name || strlen(name) >= sizeof(ev.port_name))
++		return UBUS_STATUS_INVALID_ARGUMENT;
++	strcpy(ev.port_name, name);
++
++	if ((cur = tb[PORT_CONFIG_ADMIN_EDGE]) != NULL) {
++		ev.port_config.admin_edge_port = blobmsg_get_bool(cur);
++		ev.port_config.set_admin_edge_port = true;
++	}
++	if ((cur = tb[PORT_CONFIG_AUTO_EDGE]) != NULL) {
++		ev.port_config.auto_edge_port = blobmsg_get_bool(cur);
++		ev.port_config.set_auto_edge_port = true;
++	}
++	if ((cur = tb[PORT_CONFIG_BPDU_GUARD]) != NULL) {
++		ev.port_config.bpdu_guard_port = blobmsg_get_bool(cur);
++		ev.port_config.set_bpdu_guard_port = true;
++	}
++
++	worker_queue_event(&ev);
++
++	return 0;
++}
++
+ static const struct ubus_method ustp_methods[] = {
+ 	UBUS_METHOD("add_bridge", ubus_add_bridge, bridge_config_policy),
+ 	UBUS_METHOD("bridge_state", ubus_bridge_state, bridge_state_policy),
++	UBUS_METHOD("port_config", ubus_port_config, port_config_policy),
+ };
+ 
+ static struct ubus_object_type ustp_object_type =
