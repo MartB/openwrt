@@ -907,8 +907,9 @@ void otto_l2_930x_set_port_new_sa_trap(struct otto_dsa_priv *priv, int port, boo
 	/* A locked port: frames from an unknown source address are dropped by
 	 * the chip. Trapping them only made the bridge drop them in software
 	 * (this driver does not offer MAB, so no authenticator takes them), and
-	 * let any host behind the port load the CPU. Whether EAPOL from an
-	 * unknown source still reaches hostapd (802.1X) is untested.
+	 * let any host behind the port load the CPU. EAPOL from an unknown
+	 * source still reaches the CPU on the port (the EAPOL trap wins over
+	 * the drop; tested on an XMG1915-10E), so 802.1X can still work.
 	 */
 	enum otto_l2_action action = trap ? OTTO_L2_ACTION_DROP : OTTO_L2_ACTION_FORWARD;
 	u32 new_sa_fwd_shift = (port % 10) * 3;

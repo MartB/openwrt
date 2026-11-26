@@ -55,10 +55,14 @@ int otto_mirror_930x_get_config(struct otto_mirror_config *config, int group, in
 	config->val = BIT(0);
 	config->val |= port << 9;
 
-	/* mirror mode: let mirrored packets follow TX settings of
-	 * mirroring port
+	/* Mirror mode bit 5 stays clear (the SDK's normal mode): copies leave
+	 * the mirroring port as they were on the wire of the mirrored port,
+	 * tagged or not, as a software mirred mirror would send them. With it
+	 * set, copies follow the mirroring port's own VLAN egress settings:
+	 * a copy of an untagged frame left tagged with the source VLAN, which
+	 * an access-port sniffer (or a NIC driver that drops tagged frames)
+	 * never shows.
 	 */
-	config->val |= BIT(5);
 
 	/* direction of traffic to be mirrored when a packet
 	 * hits both SPM and DPM ports: prefer egress
