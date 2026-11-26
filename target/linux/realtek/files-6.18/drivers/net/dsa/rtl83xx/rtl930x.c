@@ -427,6 +427,7 @@ const struct rtldsa_config rtldsa_930x_cfg = {
 	.pie_rule_id_is_log_counter = true,
 	.pie_cls_flower = true,
 	.pie_qos = true,
+	.pie_lists = true,
 	.port_ignore = 0x3f,
 	.vlan_tables_read = otto_vlan_930x_tables_read,
 	.vlan_set_tagged = otto_vlan_930x_set_tagged,

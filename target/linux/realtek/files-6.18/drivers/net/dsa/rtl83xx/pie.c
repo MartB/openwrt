@@ -2533,6 +2533,9 @@ static int otto_pie_930x_verify_template(struct otto_dsa_priv *priv,
 	if (pr->tos_proto_m && !otto_pie_930x_templ_has(t, RTL930X_TEMPLATE_FIELD_IP_TOS_PROTO))
 		return -1;
 
+	if (pr->spm_m && !otto_pie_930x_templ_has(t, RTL930X_TEMPLATE_FIELD_SPM0))
+		return -1;
+
 	/* TODO: Check more */
 
 	return otto_pie_find_free_slot(priv, block);
@@ -2550,10 +2553,157 @@ static bool otto_pie_block_empty(struct otto_dsa_priv *priv, int block)
  */
 static bool otto_pie_930x_block_fits(struct otto_dsa_priv *priv, struct pie_rule *pr, int block)
 {
+	if (priv->pie_block_list[block])
+		return false;
 	if (otto_pie_block_empty(priv, block))
 		return true;
 
 	return !!(priv->pie_qos_blocks & BIT(block)) == pr->qos;
+}
+
+/* Ordered lists: the entries of a list in a block of their own, the lowest prio at
+ * the lowest index. Only one entry of a block acts on a frame, the first one that
+ * matches, so a list acts as tc runs its chain.
+ */
+static int otto_pie_930x_list_move(struct otto_dsa_priv *priv, int from, int to)
+{
+	struct pie_rule *pr = priv->pie_list_rules[from];
+	int err;
+
+	/* the copy goes in first: until its old row is overwritten, both rows match
+	 * and act alike
+	 */
+	pr->id = to;
+	err = otto_pie_930x_rule_write(priv, to, pr);
+	if (err) {
+		pr->id = from;
+		return err;
+	}
+	set_bit(to, priv->pie_use_bm);
+	priv->pie_list_rules[to] = pr;
+	priv->pie_list_rules[from] = NULL;
+
+	return 0;
+}
+
+/* The row for pr in block: after the entries of lower prio and before those of
+ * higher prio. Without a free row in between, the entries move one row towards
+ * the nearest free row of the block.
+ */
+static int otto_pie_930x_list_slot(struct otto_dsa_priv *priv, struct pie_rule *pr, int block)
+{
+	int first = block * PIE_BLOCK_SIZE, end = first + PIE_BLOCK_SIZE;
+	int prev = first - 1, next = end, idx, err;
+
+	for (idx = first; idx < end; idx++) {
+		struct pie_rule *o = priv->pie_list_rules[idx];
+
+		if (!o)
+			continue;
+		if (o->list_prio < pr->list_prio)
+			prev = idx;
+		else if (next == end)
+			next = idx;
+	}
+	if (next < prev)
+		return -EINVAL;
+
+	for (idx = prev + 1; idx < next; idx++)
+		if (!test_bit(idx, priv->pie_use_bm))
+			return idx;
+
+	for (idx = next; idx < end && test_bit(idx, priv->pie_use_bm); idx++)
+		;
+	if (idx < end) {
+		for (; idx > next; idx--) {
+			err = otto_pie_930x_list_move(priv, idx - 1, idx);
+			if (err)
+				return err;
+		}
+		return next;
+	}
+
+	for (idx = prev; idx >= first && test_bit(idx, priv->pie_use_bm); idx--)
+		;
+	if (idx >= first) {
+		for (; idx < prev; idx++) {
+			err = otto_pie_930x_list_move(priv, idx + 1, idx);
+			if (err)
+				return err;
+		}
+		return prev;
+	}
+
+	return -ENOSPC;
+}
+
+static int otto_pie_930x_list_template(struct otto_dsa_priv *priv, struct pie_rule *pr, int block)
+{
+	u32 t_select;
+	int err;
+
+	err = regmap_read(priv->map, RTL930X_PIE_BLK_TMPLTE_CTRL(block), &t_select);
+	if (err)
+		return err;
+	for (int j = 0; j < 2; j++)
+		if (otto_pie_930x_verify_template(priv, pr, (t_select >> (j * 4)) & 0xf, block) != -1)
+			return j;
+
+	return -EOPNOTSUPP;
+}
+
+static int otto_pie_930x_list_add(struct otto_dsa_priv *priv, struct pie_rule *pr)
+{
+	int max_block = priv->r->n_pie_blocks / 2;
+	int block, j, idx, err;
+
+	if (pr->is_egress)
+		return -EOPNOTSUPP;
+
+	guard(mutex)(&priv->pie_mutex);
+
+	for (block = 0; block < max_block; block++)
+		if (priv->pie_block_list[block] == pr->list)
+			break;
+	if (block == max_block) {
+		for (block = 0; block < max_block; block++) {
+			if ((priv->pie_failed_blocks & BIT(block)) || !otto_pie_block_empty(priv, block))
+				continue;
+			if (otto_pie_930x_list_template(priv, pr, block) >= 0)
+				break;
+		}
+		if (block == max_block)
+			return -ENOSPC;
+	}
+
+	j = otto_pie_930x_list_template(priv, pr, block);
+	if (j < 0)
+		return j;
+
+	idx = otto_pie_930x_list_slot(priv, pr, block);
+	if (idx < 0)
+		return idx;
+
+	priv->pie_block_list[block] = pr->list;
+	pr->valid = true;
+	pr->tid = j;
+	pr->tid_m = 0x1;
+	pr->id = idx;
+	set_bit(idx, priv->pie_use_bm);
+	priv->pie_list_rules[idx] = pr;
+
+	err = otto_pie_930x_rule_write(priv, idx, pr);
+	if (!err)
+		err = otto_pie_930x_lookup_enable(priv, idx);
+	if (err) {
+		otto_pie_930x_rule_rollback(priv, pr);
+		priv->pie_list_rules[idx] = NULL;
+		if (otto_pie_block_empty(priv, block))
+			priv->pie_block_list[block] = 0;
+		dev_err(priv->dev, "TC list rule programming failed: %d\n", err);
+	}
+
+	return err;
 }
 
 int otto_pie_930x_rule_add(struct otto_dsa_priv *priv, struct pie_rule *pr)
@@ -2562,6 +2712,9 @@ int otto_pie_930x_rule_add(struct otto_dsa_priv *priv, struct pie_rule *pr)
 	int idx, block, j, t, err;
 	int min_block = 0;
 	int max_block = priv->r->n_pie_blocks / 2;
+
+	if (pr->list)
+		return otto_pie_930x_list_add(priv, pr);
 
 	if (pr->is_egress) {
 		min_block = max_block;
@@ -2657,8 +2810,16 @@ void otto_pie_930x_rule_rm(struct otto_dsa_priv *priv, struct pie_rule *pr)
 
 	guard(mutex)(&priv->pie_mutex);
 
-	if (!otto_pie_930x_rule_del(priv, idx, idx))
-		clear_bit(idx, priv->pie_use_bm);
+	if (otto_pie_930x_rule_del(priv, idx, idx))
+		return;
+	clear_bit(idx, priv->pie_use_bm);
+	if (pr->list) {
+		int block = idx / PIE_BLOCK_SIZE;
+
+		priv->pie_list_rules[idx] = NULL;
+		if (otto_pie_block_empty(priv, block))
+			priv->pie_block_list[block] = 0;
+	}
 }
 
 /* debugfs realtek_otto_pie/rules: the rows in use, as the chip holds them (word 0
@@ -2673,6 +2834,9 @@ static int otto_pie_930x_rules_show(struct seq_file *m, void *v)
 	guard(mutex)(&priv->pie_mutex);
 
 	seq_printf(m, "qos blocks: %08x\n", priv->pie_qos_blocks);
+	for (int b = 0; b < priv->r->n_pie_blocks && b < ARRAY_SIZE(priv->pie_block_list); b++)
+		if (priv->pie_block_list[b])
+			seq_printf(m, "block %d: list %u\n", b, priv->pie_block_list[b]);
 	for (int idx = 0; idx < n; idx++) {
 		u32 r[19] = {};
 

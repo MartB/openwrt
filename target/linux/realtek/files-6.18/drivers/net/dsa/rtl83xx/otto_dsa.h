@@ -311,6 +311,12 @@ struct pie_rule {
 	 * neither hides nor is hidden by a rule that drops or forwards
 	 */
 	bool qos;
+	/* An entry of an ordered list: a rule of a tc chain other than 0, in hardware
+	 * only. The entries of a list sit in a PIE block of their own, sorted by prio,
+	 * so that the first one that matches acts, as in tc. 0: no list.
+	 */
+	u32 list;
+	u32 list_prio;
 
 	/* Fields used in predefined templates 0-2 on RTL8380 / 90 / 9300 */
 	u64 spm;		/* Source Port Matrix */
@@ -432,6 +438,10 @@ struct rtldsa_config {
 	 * priority, remark DSCP/precedence/TOS and the PCP of the egress tag
 	 */
 	bool pie_qos;
+	/* flower rules of chains other than 0 (skip_sw) are ordered lists: drop or
+	 * accept, the first entry of a list that matches acts
+	 */
+	bool pie_lists;
 	u8 num_lag_ids;
 	u8 cpu_port;
 	u8 port_ignore;
@@ -598,6 +608,9 @@ struct otto_dsa_priv {
 	struct mutex pie_mutex;		/* Mutex for Packet Inspection Engine */
 	u32 pie_failed_blocks;		/* RTL930x blocks disabled after failed rollback */
 	u32 pie_qos_blocks;		/* RTL930x blocks holding classifying (qos) rules */
+	u32 pie_block_list[32];		/* RTL930x: the ordered list a block holds, 0: none */
+	struct pie_rule *pie_list_rules[MAX_PIE_ENTRIES];	/* the entries of ordered lists */
+	struct list_head tc_lists;	/* rules of ordered lists (tc.c), under tc_flow_lock */
 	int link_state_irq;
 	bool link_state_irq_requested;
 	int mirror_group_ports[4];

@@ -8,6 +8,7 @@
 #include <linux/netdevice.h>
 #include <linux/regmap.h>
 #include <net/flow_offload.h>
+#include <linux/list.h>
 #include <linux/rhashtable.h>
 #include <asm/mach-rtl-otto/mach-rtl-otto.h>
 
@@ -18,6 +19,14 @@
 #include "stats.h"
 #include "tc.h"
 
+/* The PIE entry of a rule of an ordered list, shared by every port the rule is on */
+struct otto_tc_list {
+	struct list_head node;
+	struct pie_rule rule;
+	u64 ports;
+	u8 port_refs[57];
+};
+
 struct rtl83xx_flow {
 	unsigned long cookie;
 	struct rhash_head node;
@@ -25,6 +34,8 @@ struct rtl83xx_flow {
 	struct otto_dsa_priv *priv;
 	struct pie_rule rule;
 	u32 flags;
+	struct otto_tc_list *list;	/* a rule of an ordered list: its entry */
+	int port;
 };
 
 #define RTL930X_BANDWIDTH_CTRL_EGRESS(port)	(0x7660 + (port * 16))
@@ -281,7 +292,7 @@ static int otto_tc_validate_flow_actions(struct otto_dsa_priv *priv, struct flow
 					 bool *qos)
 {
 	const struct flow_action_entry *act;
-	bool drop = false, fwd = false;
+	bool drop = false, fwd = false, accept = false;
 	u64 marks = 0;
 	int i, count = 0;
 
@@ -290,6 +301,9 @@ static int otto_tc_validate_flow_actions(struct otto_dsa_priv *priv, struct flow
 		switch (act->id) {
 		case FLOW_ACTION_DROP:
 			drop = true;
+			break;
+		case FLOW_ACTION_ACCEPT:
+			accept = true;
 			break;
 		case FLOW_ACTION_TRAP:
 		case FLOW_ACTION_REDIRECT:
@@ -316,7 +330,7 @@ static int otto_tc_validate_flow_actions(struct otto_dsa_priv *priv, struct flow
 		}
 	}
 
-	if (!count || (drop && count != 1) || (marks && fwd))
+	if (!count || (drop && count != 1) || (accept && count != 1) || (marks && fwd))
 		return -EOPNOTSUPP;
 
 	*qos = !!marks;
@@ -407,6 +421,15 @@ static int otto_tc_add_flow(struct otto_dsa_priv *priv, struct flow_cls_offload 
 	if (err)
 		return err;
 
+	/* a rule of an ordered list drops or accepts, and an accept only means
+	 * something in a list: it keeps the later entries of the list off the frame
+	 */
+	if (f->common.chain_index ?
+	    (rule->action.entries[0].id != FLOW_ACTION_DROP &&
+	     rule->action.entries[0].id != FLOW_ACTION_ACCEPT) :
+	    rule->action.entries[0].id == FLOW_ACTION_ACCEPT)
+		return -EOPNOTSUPP;
+
 	err = otto_tc_parse_flow_rule(priv, rule, flow);
 	if (err)
 		return err;
@@ -451,6 +474,10 @@ static int otto_tc_add_flow(struct otto_dsa_priv *priv, struct flow_cls_offload 
 			flow->rule.fwd_data = priv->r->cpu_port;
 			flow->rule.fwd_act = PIE_ACT_REDIRECT_TO_PORT;
 			otto_tc_flow_bypass_all(flow);
+			break;
+
+		case FLOW_ACTION_ACCEPT:
+			/* an entry that sets nothing: it only takes the frame */
 			break;
 
 		case FLOW_ACTION_ADD:
@@ -564,10 +591,141 @@ int otto_tc_init(struct otto_dsa_priv *priv)
 		return err;
 
 	mutex_init(&priv->tc_flow_lock);
+	INIT_LIST_HEAD(&priv->tc_lists);
 	INIT_DELAYED_WORK(&priv->red_work, otto_tc_red_poll);
 	priv->tc_initialized = true;
 
 	return 0;
+}
+
+/* A rule of an ordered list (a chain other than 0, skip_sw) on any number of ports
+ * is one PIE entry: the ports it is on are its source port mask. A frame matches
+ * when the mask bits of the ports the rule is not on are 0 - as for a frame from
+ * a port the rule is on, whose port is the only bit it sets. The entries move
+ * when another one goes in before them, so they count no packets.
+ */
+static u64 otto_tc_list_spm_m(struct otto_dsa_priv *priv, u64 ports)
+{
+	return GENMASK_ULL(priv->r->cpu_port, 0) & ~ports;
+}
+
+/* the same rule but for what the entry sets for itself */
+static bool otto_tc_list_same(const struct pie_rule *a, const struct pie_rule *b)
+{
+	struct pie_rule x;
+
+	memcpy(&x, b, sizeof(x));
+	x.id = a->id;
+	x.valid = a->valid;
+	x.tid = a->tid;
+	x.tid_m = a->tid_m;
+	x.spm = a->spm;
+	x.spm_m = a->spm_m;
+	x.spn = a->spn;
+	x.spn_m = a->spn_m;
+	x.packet_cntr = a->packet_cntr;
+	x.last_packet_cnt = a->last_packet_cnt;
+	x.log_sel = a->log_sel;
+	x.log_data = a->log_data;
+
+	return !memcmp(a, &x, sizeof(x));
+}
+
+static int otto_tc_list_rewrite(struct otto_dsa_priv *priv, struct otto_tc_list *l)
+{
+	l->rule.spm_m = otto_tc_list_spm_m(priv, l->ports);
+	guard(mutex)(&priv->pie_mutex);
+
+	return priv->r->pie_rule_write(priv, l->rule.id, &l->rule);
+}
+
+static int otto_tc_list_get(struct otto_dsa_priv *priv, struct rtl83xx_flow *flow,
+			    struct flow_cls_offload *f, int port)
+{
+	struct otto_tc_list *l;
+	int err;
+
+	if (!priv->r->pie_lists || !f->common.skip_sw || flow->rule.is_egress ||
+	    port < 0 || port >= ARRAY_SIZE(l->port_refs))
+		return -EOPNOTSUPP;
+
+	flow->rule.list = f->common.chain_index;
+	flow->rule.list_prio = f->common.prio;
+	flow->port = port;
+
+	list_for_each_entry(l, &priv->tc_lists, node) {
+		if (l->rule.list != flow->rule.list || l->rule.list_prio != flow->rule.list_prio)
+			continue;
+		if (!otto_tc_list_same(&l->rule, &flow->rule)) {
+			NL_SET_ERR_MSG_MOD(f->common.extack,
+					   "the list has another rule at this prio");
+			return -EOPNOTSUPP;
+		}
+		if (!l->port_refs[port]) {
+			l->ports |= BIT_ULL(port);
+			err = otto_tc_list_rewrite(priv, l);
+			if (err) {
+				l->ports &= ~BIT_ULL(port);
+				otto_tc_list_rewrite(priv, l);
+				return err;
+			}
+		}
+		l->port_refs[port]++;
+		flow->list = l;
+		return 0;
+	}
+
+	l = kzalloc(sizeof(*l), GFP_KERNEL);
+	if (!l)
+		return -ENOMEM;
+	memcpy(&l->rule, &flow->rule, sizeof(l->rule));
+	l->rule.spn = 0;
+	l->rule.spn_m = 0;
+	l->rule.spm = 0;
+	l->ports = BIT_ULL(port);
+	l->port_refs[port] = 1;
+	l->rule.spm_m = otto_tc_list_spm_m(priv, l->ports);
+	l->rule.log_sel = false;
+	l->rule.packet_cntr = -1;
+
+	err = priv->r->pie_rule_add(priv, &l->rule);
+	if (err) {
+		kfree(l);
+		return err;
+	}
+	list_add_tail(&l->node, &priv->tc_lists);
+	flow->list = l;
+
+	return 0;
+}
+
+static void otto_tc_list_put(struct otto_dsa_priv *priv, struct rtl83xx_flow *flow)
+{
+	struct otto_tc_list *l = flow->list;
+
+	flow->list = NULL;
+	if (--l->port_refs[flow->port])
+		return;
+
+	l->ports &= ~BIT_ULL(flow->port);
+	if (l->ports) {
+		if (otto_tc_list_rewrite(priv, l))
+			dev_err(priv->dev, "port %d stays on a list rule\n", flow->port);
+		return;
+	}
+
+	priv->r->pie_rule_rm(priv, &l->rule);
+	list_del(&l->node);
+	kfree(l);
+}
+
+/* the hardware side of a flow on its way out */
+static void otto_tc_flow_rm(struct otto_dsa_priv *priv, struct rtl83xx_flow *flow)
+{
+	if (flow->list)
+		otto_tc_list_put(priv, flow);
+	else
+		priv->r->pie_rule_rm(priv, &flow->rule);
 }
 
 /* Zero a PIE rule's LOG-table packet counter */
@@ -597,7 +755,7 @@ static void otto_tc_flow_free(void *ptr, void *arg)
 	struct rtl83xx_flow *flow = ptr;
 	struct otto_dsa_priv *priv = arg;
 
-	priv->r->pie_rule_rm(priv, &flow->rule);
+	otto_tc_flow_rm(priv, flow);
 	otto_tc_packet_cntr_put(priv, flow->rule.packet_cntr);
 	if (flow->rule.mir_sel)
 		otto_mirror_group_put(priv, flow->rule.mir_data);
@@ -682,6 +840,14 @@ static int otto_tc_configure_flower(struct otto_dsa_priv *priv,
 	if (err)
 		goto out_remove;
 
+	if (f->common.chain_index) {
+		err = otto_tc_list_get(priv, flow, f, ingress_port);
+		if (err)
+			goto out_remove;
+		mutex_unlock(&priv->tc_flow_lock);
+		return 0;
+	}
+
 	flow->rule.spn = ingress_port;
 	flow->rule.spn_m = 0x7f;
 
@@ -757,7 +923,7 @@ static int otto_tc_delete_flower(struct otto_dsa_priv *priv,
 	if (err)
 		goto out_unlock;
 
-	priv->r->pie_rule_rm(priv, &flow->rule);
+	otto_tc_flow_rm(priv, flow);
 	otto_tc_packet_cntr_put(priv, flow->rule.packet_cntr);
 	if (flow->rule.mir_sel)
 		otto_mirror_group_put(priv, flow->rule.mir_data);
@@ -823,11 +989,13 @@ static int otto_tc_pie_cls_flower_add(struct otto_dsa_priv *priv, int port,
 	if (!ingress || !priv->r->pie_cls_flower)
 		return -EOPNOTSUPP;
 
-	/* No goto chain is offloaded, so in hardware a rule of another chain
-	 * would see frames that never reach it in software.
+	/* No goto chain is offloaded, so in hardware a rule of another chain sees
+	 * frames that never reach it in software: such a rule is an entry of an
+	 * ordered list (otto_tc_list_get()), in hardware only.
 	 */
-	if (cls->common.chain_index) {
-		NL_SET_ERR_MSG_MOD(cls->common.extack, "only chain 0 is offloaded");
+	if (cls->common.chain_index && (!priv->r->pie_lists || !cls->common.skip_sw)) {
+		NL_SET_ERR_MSG_MOD(cls->common.extack,
+				   "only chain 0 is offloaded, other chains as skip_sw lists");
 		return -EOPNOTSUPP;
 	}
 
