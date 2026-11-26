@@ -92,6 +92,9 @@
 #define RTL930X_FC_PORT_THR_SET_SEL(port)	(0xD8F4 + (((port) >> 4) << 2))
 #define RTL930X_FC_THR_SET_SEL_MASK(port)	(0x3 << (((port) & 0xf) << 1))
 #define RTL930X_FC_THR_SET_10G			2
+#define RTL930X_FC_CPU_Q_EGR_DROP_THR(queue)	(0x7DC0 + ((queue) << 2))
+#define RTL930X_FC_CPU_Q_EGR_FORCE_DROP_CTRL	(0xC4DC)
+#define RTL930X_FC_CPU_QUEUES			32
 #define RTL930X_SWRED_PORT_CTRL			(0x7A04)
 #define RTL930X_SWRED_QUEUE_DROP_CTRL(queue, dp) \
 						(0x7A08 + ((queue) * 12) + ((dp) << 2))
@@ -623,6 +626,23 @@ static void otto_qos_930x_set_port_thr_sets(struct otto_dsa_priv *priv)
 	}
 }
 
+/* With the reset value of REF_RXCNGST a CPU queue only drops at its threshold while the sending port
+ * counts as congested, which a port flooding the CPU never does: in a loop storm the queue behind
+ * its trap policer fills the whole shared buffer. The vendor SDK clears it for the CPU port at init.
+ * Thresholds (in 256 byte pages, on/off) as the vendor firmware sets them on every RTL930x.
+ */
+static void otto_qos_930x_set_cpu_thresholds(struct otto_dsa_priv *priv)
+{
+	static const u16 thr[2] = { 0x4e, 0x44 };
+
+	regmap_clear_bits(priv->map, RTL930X_FC_PORT_EGR_DROP_CTRL(priv->r->cpu_port),
+			  RTL930X_FC_PORT_EGR_DROP_REF_RXCNGST);
+	regmap_write(priv->map, RTL930X_FC_CPU_Q_EGR_FORCE_DROP_CTRL,
+		     GENMASK(RTL930X_FC_CPU_QUEUES - 1, 0));
+	for (int queue = 0; queue < RTL930X_FC_CPU_QUEUES; queue++)
+		regmap_write(priv->map, RTL930X_FC_CPU_Q_EGR_DROP_THR(queue), otto_qos_930x_thr(thr));
+}
+
 static void otto_qos_930x_set_fc_thresholds(struct otto_dsa_priv *priv)
 {
 	u32 mask = RTL930X_FC_GLB_THR_ON_MASK | RTL930X_FC_GLB_THR_OFF_MASK;
@@ -662,6 +682,8 @@ static void otto_qos_930x_set_fc_thresholds(struct otto_dsa_priv *priv)
 	 */
 	if (!few_ports)
 		otto_qos_930x_set_port_thr_sets(priv);
+
+	otto_qos_930x_set_cpu_thresholds(priv);
 }
 
 static u32 otto_qos_930x_red_tail_drop(struct otto_dsa_priv *priv, int queue)
