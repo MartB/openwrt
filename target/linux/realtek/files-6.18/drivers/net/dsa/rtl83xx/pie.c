@@ -2330,15 +2330,18 @@ static void otto_pie_930x_write_fixed_fields(u32 r[],  struct pie_rule *pr)
 
 static void otto_pie_930x_write_action(u32 r[],  struct pie_rule *pr)
 {
-	/* Either drop or forward */
+	/* Either drop or forward (SDK longan VACL/IACL: ACT_MSK_DROP 152, YELLOW 153,
+	 * RED 154; DROP_ACT 151, YELLOW_DROP_ACT 150, RED_DROP_ACT 149; ACT_MSK_FWD
+	 * 155, FWD_ACT 148:146, FWD_SEL 142)
+	 */
 	if (pr->drop) {
 		r[14] |= BIT(24) | BIT(25) | BIT(26); /* Do Green, Yellow and Red drops */
 		/* Actually DROP, not PERMIT in Green / Yellow / Red */
-		r[14] |= BIT(23) | BIT(22) | BIT(20);
-	} else {
-		r[14] |= pr->fwd_sel ? BIT(27) : 0;
+		r[14] |= BIT(23) | BIT(22) | BIT(21);
+	} else if (pr->fwd_sel) {
+		r[14] |= BIT(27);
 		r[14] |= pr->fwd_act << 18;
-		r[14] |= BIT(14); /* We overwrite any drop */
+		r[14] |= BIT(14); /* the forward overwrites a drop (FWD_SEL) */
 	}
 	if (pr->phase == PHASE_VACL)
 		r[14] |= pr->fwd_sa_lrn ? BIT(15) : 0;
