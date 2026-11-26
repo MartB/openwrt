@@ -35,6 +35,10 @@
 #define RTL838X_ACL_BLK_TMPLTE_CTRL(block)	(0x6108 + ((block) << 2))
 #define RTL839X_ACL_BLK_TMPLTE_CTRL(block)	(0x128c + ((block) << 2))
 #define RTL930X_PIE_BLK_TMPLTE_CTRL(block)	(0xa624 + ((block) << 2))
+/* GRP_ID 7:4, LOGIC_ID 3:0: the blocks of one logical block of one group give a
+ * single hit between them, the lowest index (SDK dal_longan_pie_blockGrouping_set)
+ */
+#define RTL930X_PIE_BLK_GROUP_CTRL(block)	(0xa5e4 + ((block) << 2))
 #define RTL931X_PIE_BLK_TMPLTE_CTRL(block)	(0x4214 + ((block) << 2))
 
 #define RTL838X_ACL_BLK_GROUP_CTRL		(0x615C)
@@ -2725,6 +2729,14 @@ void otto_pie_930x_init(struct otto_dsa_priv *priv)
 
 	/* Assign blocks 0-7 to VACL phase (bit = 0), blocks 8-15 to IACL (bit = 1) */
 	regmap_write(priv->map, RTL930X_PIE_BLK_PHASE_CTRL, 0xff00);
+
+	/* Each block a group of its own, so that the hits of all blocks act together.
+	 * At reset all blocks are one group and one logical block: the first rule
+	 * that matched a frame anywhere hid the rules of every later block (an
+	 * accepting or classifying rule hid a drop).
+	 */
+	for (int i = 0; i < priv->r->n_pie_blocks; i++)
+		regmap_write(priv->map, RTL930X_PIE_BLK_GROUP_CTRL(i), i << 4);
 
 	/* Enable predefined templates 0, 1 for first quarter of all blocks */
 	template_selectors = 0 | (1 << 4);
