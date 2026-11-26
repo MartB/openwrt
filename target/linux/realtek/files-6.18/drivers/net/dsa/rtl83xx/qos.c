@@ -80,7 +80,18 @@
 #define RTL930X_FC_PORT_EGR_DROP_REF_RXCNGST	BIT(1)
 #define RTL930X_FC_Q_EGR_DROP_THR(queue, set)	(0x791C + ((((queue) << 2) + (set)) << 2))
 #define RTL930X_FC_Q_EGR_DROP_THR_ON_MASK	GENMASK(27, 16)
+#define RTL930X_FC_Q_EGR_DROP_THR_OFF_MASK	GENMASK(11, 0)
 #define RTL930X_FC_Q_EGR_DROP_THR_SETS		4
+#define RTL930X_FC_Q_EGR_DROP_THR_QUEUES	12
+#define RTL930X_FC_PORT_EGR_DROP_THR_SET_SEL(port) \
+						(0x79DC + (((port) >> 4) << 2))
+#define RTL930X_FC_PORT_HI_THR(set)		(0xD8A4 + ((set) << 2))
+#define RTL930X_FC_PORT_LO_THR(set)		(0xD8B4 + ((set) << 2))
+#define RTL930X_FC_PORT_FCOFF_HI_THR(set)	(0xD8C4 + ((set) << 2))
+#define RTL930X_FC_PORT_FCOFF_LO_THR(set)	(0xD8D4 + ((set) << 2))
+#define RTL930X_FC_PORT_THR_SET_SEL(port)	(0xD8F4 + (((port) >> 4) << 2))
+#define RTL930X_FC_THR_SET_SEL_MASK(port)	(0x3 << (((port) & 0xf) << 1))
+#define RTL930X_FC_THR_SET_10G			2
 #define RTL930X_SWRED_PORT_CTRL			(0x7A04)
 #define RTL930X_SWRED_QUEUE_DROP_CTRL(queue, dp) \
 						(0x7A08 + ((queue) * 12) + ((dp) << 2))
@@ -563,6 +574,55 @@ static void otto_qos_930x_set_scheduling_queue_weights(struct otto_dsa_priv *pri
 		otto_qos_queue_sched_reset(priv, dp->index);
 }
 
+/* Per-port threshold sets of the vendor firmware for boards with more than 8 user ports, in 256 byte
+ * pages as {on, off}: ingress (source port congestion) high and low, and the egress queue drop
+ * threshold. Set 0 is for 1G/2.5G ports, set 2 for 10G ports; 1 and 3 are not selected here.
+ */
+static const struct {
+	u16 hi[2], lo[2], egr[2];
+} otto_qos_930x_thr_sets[RTL930X_FC_Q_EGR_DROP_THR_SETS] = {
+	{ { 0xab, 0xa1 }, { 0x28, 0x1e }, { 0x4e, 0x44 } },
+	{ { 0xab, 0xa1 }, { 0x28, 0x1e }, { 0x4e, 0x44 } },
+	{ { 0x2ac, 0x284 }, { 0xa0, 0x78 }, { 0x118, 0xf0 } },
+	{ { 0x5e, 0x54 }, { 0x23, 0x19 }, { 0x64, 0x44 } },
+};
+
+static u32 otto_qos_930x_thr(const u16 *thr)
+{
+	return FIELD_PREP(RTL930X_FC_GLB_THR_ON_MASK, thr[0]) |
+	       FIELD_PREP(RTL930X_FC_GLB_THR_OFF_MASK, thr[1]);
+}
+
+static void otto_qos_930x_set_port_thr_sets(struct otto_dsa_priv *priv)
+{
+	struct dsa_port *dp;
+
+	for (int set = 0; set < RTL930X_FC_Q_EGR_DROP_THR_SETS; set++) {
+		u32 hi = otto_qos_930x_thr(otto_qos_930x_thr_sets[set].hi);
+		u32 lo = otto_qos_930x_thr(otto_qos_930x_thr_sets[set].lo);
+		u32 egr = otto_qos_930x_thr(otto_qos_930x_thr_sets[set].egr);
+
+		regmap_write(priv->map, RTL930X_FC_PORT_HI_THR(set), hi);
+		regmap_write(priv->map, RTL930X_FC_PORT_LO_THR(set), lo);
+		regmap_write(priv->map, RTL930X_FC_PORT_FCOFF_HI_THR(set), hi);
+		regmap_write(priv->map, RTL930X_FC_PORT_FCOFF_LO_THR(set), lo);
+
+		for (int queue = 0; queue < RTL930X_FC_Q_EGR_DROP_THR_QUEUES; queue++)
+			regmap_write(priv->map, RTL930X_FC_Q_EGR_DROP_THR(queue, set), egr);
+	}
+
+	/* ports 24-27 are the 10G MACs; their DT phy-mode says little, as SFP+ cages start as 1000base-x */
+	dsa_switch_for_each_user_port(dp, priv->ds) {
+		u32 mask = RTL930X_FC_THR_SET_SEL_MASK(dp->index);
+		u32 set = dp->index >= 24 ? RTL930X_FC_THR_SET_10G : 0;
+
+		regmap_update_bits(priv->map, RTL930X_FC_PORT_THR_SET_SEL(dp->index), mask,
+				   field_prep(mask, set));
+		regmap_update_bits(priv->map, RTL930X_FC_PORT_EGR_DROP_THR_SET_SEL(dp->index), mask,
+				   field_prep(mask, set));
+	}
+}
+
 static void otto_qos_930x_set_fc_thresholds(struct otto_dsa_priv *priv)
 {
 	u32 mask = RTL930X_FC_GLB_THR_ON_MASK | RTL930X_FC_GLB_THR_OFF_MASK;
@@ -594,6 +654,14 @@ static void otto_qos_930x_set_fc_thresholds(struct otto_dsa_priv *priv)
 	/* egress drop thresholds and RED only act once the buffer holds more pages than this */
 	regmap_update_bits(priv->map, RTL930X_FC_GLB_SYS_UTIL_THR,
 			   RTL930X_FC_GLB_SYS_UTIL_THR_MASK, 1);
+
+	/* An egress queue drops at the threshold of its set only while the source port counts as
+	 * congested, e.g. with several ports sending into one; with a single sender it grows to
+	 * the global low threshold. Use the vendor sets for parity; they differ by chip and only
+	 * the larger boards' ones are known here.
+	 */
+	if (!few_ports)
+		otto_qos_930x_set_port_thr_sets(priv);
 }
 
 static u32 otto_qos_930x_red_tail_drop(struct otto_dsa_priv *priv, int queue)
