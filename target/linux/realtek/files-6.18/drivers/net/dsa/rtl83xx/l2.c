@@ -22,6 +22,7 @@ enum otto_l2_action {
 #define RTL838X_L2_CTRL_0			(0x3200)
 #define RTL839X_L2_CTRL_0			(0x3800)
 #define RTL930X_L2_CTRL				(0x8FD8)
+#define RTL930X_L2_CTRL_ZERO_SA_LRN		BIT(2)
 #define RTL931X_L2_CTRL				(0xC800)
 
 #define RTL838X_L2_TBL_FLUSH_CTRL		(0x3370)
@@ -889,6 +890,12 @@ void otto_l2_930x_learning_setup(struct otto_dsa_priv *priv)
 
 	/* Limit learning to maximum: 32k entries, after that just flood (bits 0-1) */
 	regmap_write(priv->map, RTL930X_L2_LRN_CONSTRT_CTRL, (0x7fff << 2) | 0);
+
+	/* Do not learn 00:00:00:00:00:00 as a source. It is on by default, so the
+	 * chip kept an FDB entry the bridge never has (the bridge drops frames with
+	 * an invalid source). The vendor firmware turns it off as well.
+	 */
+	regmap_clear_bits(priv->map, RTL930X_L2_CTRL, RTL930X_L2_CTRL_ZERO_SA_LRN);
 
 	/* TODO: Figure out if this is necessary */
 	regmap_set_bits(priv->map, RTL930X_L2_PORT_SABLK_CTRL, GENMASK(priv->r->cpu_port - 1, 0));
